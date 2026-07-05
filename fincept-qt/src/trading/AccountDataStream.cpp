@@ -9,6 +9,7 @@
 #include "trading/instruments/InstrumentService.h"
 #include "trading/brokers/alpaca/AlpacaWebSocket.h"
 #include "trading/websocket/AliceBlueWebSocket.h"
+#include "trading/websocket/AngelOneWebSocket.h"
 #include "trading/websocket/BrokerWebSocketBase.h"
 #include "trading/websocket/DhanWebSocket.h"
 #include "trading/websocket/FivePaisaWebSocket.h"
@@ -19,6 +20,7 @@
 #include "trading/websocket/MotilalPoller.h"
 #include "trading/websocket/ShoonyaWebSocket.h"
 #include "trading/websocket/UpstoxWebSocket.h"
+#include "trading/websocket/ZerodhaWebSocket.h"
 
 #include <QDate>
 #include <QDateTime>
@@ -133,9 +135,21 @@ void AccountDataStream::resume() {
         active_feed_timer_->start();
 }
 
+void AccountDataStream::refresh_portfolio_now() {
+    if (!running_)
+        return;
+    async_fetch_positions();
+    async_fetch_holdings();
+    async_fetch_orders();
+    async_fetch_funds();
+}
+
 // ── Symbol management ───────────────────────────────────────────────────────
 
 void AccountDataStream::subscribe_symbols(const QString& consumer_id, const QStringList& symbols) {
+    LOG_INFO("subdbg", QString("subscribe_symbols consumer='%1' (%2 syms): [%3] ws_connected=%4")
+                           .arg(consumer_id).arg(symbols.size())
+                           .arg(symbols.join(','), ws_connected() ? "Y" : "N"));
     if (symbols.isEmpty())
         consumer_symbols_.remove(consumer_id);
     else
@@ -345,6 +359,9 @@ void AccountDataStream::async_fetch_positions() {
                 self->check_token_expiry(result.error);
             return;
         }
+        // Success — log the count so an empty live blotter can be told apart from a
+        // token/error (which logs WARN above): 0 rows here = genuinely no positions.
+        LOG_INFO(ADS_TAG, QString("get_positions %1/%2 → %3 row(s)").arg(bid, acct_id).arg(result.data->size()));
         QMetaObject::invokeMethod(self, [self, acct_id, data = *result.data]() {
             if (!self) return;
             self->positions_ = data;
@@ -372,6 +389,7 @@ void AccountDataStream::async_fetch_holdings() {
                 self->check_token_expiry(result.error);
             return;
         }
+        LOG_INFO(ADS_TAG, QString("get_holdings %1/%2 → %3 row(s)").arg(bid, acct_id).arg(result.data->size()));
         QMetaObject::invokeMethod(self, [self, acct_id, data = *result.data]() {
             if (!self) return;
             self->holdings_ = data;
@@ -399,6 +417,7 @@ void AccountDataStream::async_fetch_orders() {
                 self->check_token_expiry(result.error);
             return;
         }
+        LOG_INFO(ADS_TAG, QString("get_orders %1/%2 → %3 row(s)").arg(bid, acct_id).arg(result.data->size()));
         QMetaObject::invokeMethod(self, [self, acct_id, data = *result.data]() {
             if (!self) return;
             self->orders_ = data;
@@ -723,6 +742,19 @@ void AccountDataStream::wire_base_ws(BrokerWebSocketBase* ws) {
     connect(ws, &BrokerWebSocketBase::depth_received, this, [this](const MarketDepth& d) {
         if (d.bids.isEmpty() && d.asks.isEmpty())
             return;
+        // FULL-mode feeds (e.g. Dhan) stream depth for EVERY subscribed watchlist
+        // symbol, but the depth table is single-symbol. Drop books that aren't for
+        // the selected symbol, else every stock's book rotates through the table.
+        // Guarded on a populated d.symbol so brokers that don't tag depth are unaffected.
+        auto bare = [](QString s) {
+            const int colon = s.lastIndexOf(QLatin1Char(':'));
+            if (colon >= 0) s = s.mid(colon + 1);
+            if (s.endsWith(QLatin1String("-EQ"))) s.chop(3);
+            return s;
+        };
+        if (!selected_symbol_.isEmpty() && !d.symbol.isEmpty() &&
+            bare(d.symbol).compare(bare(selected_symbol_), Qt::CaseInsensitive) != 0)
+            return;
         QVector<QPair<double, double>> bids, asks;
         for (const auto& b : d.bids)
             bids.append({b.price, static_cast<double>(b.quantity)});
@@ -744,6 +776,17 @@ void AccountDataStream::wire_base_ws(BrokerWebSocketBase* ws) {
         LOG_ERROR(ADS_TAG, QString("WS error: %1").arg(e));
         check_token_expiry(e);
     });
+}
+
+// Map a normalised exchange string → Angel One SmartStream segment code.
+static AoExchangeType ao_exchange_type(const QString& exch) {
+    const QString e = exch.toUpper();
+    if (e == "NFO" || e == "NSE_FO") return AoExchangeType::NSE_FO;
+    if (e == "BSE") return AoExchangeType::BSE_CM;
+    if (e == "BFO" || e == "BSE_FO") return AoExchangeType::BSE_FO;
+    if (e == "MCX") return AoExchangeType::MCX_FO;
+    if (e == "CDS") return AoExchangeType::CDE_FO;
+    return AoExchangeType::NSE_CM; // NSE cash / default
 }
 
 void AccountDataStream::ws_init() {
@@ -770,6 +813,7 @@ void AccountDataStream::ws_init() {
             q.change = tick.ltp - tick.prev_close;
             q.change_pct = tick.prev_close > 0 ? ((tick.ltp - tick.prev_close) / tick.prev_close) * 100.0 : 0;
             q.timestamp = tick.timestamp;
+            q.oi = qint64(tick.oi);  // F&O open interest; 0 for cash/equity ticks
             quote_cache_[tick.symbol] = q;
             emit quote_updated(account_id_, tick.symbol, q);
         });
@@ -803,7 +847,19 @@ void AccountDataStream::ws_init() {
             LOG_INFO(ADS_TAG, QString("Fyers HSM connected for %1").arg(account_id_));
             emit connection_state_changed(account_id_, ConnectionState::Connected);
             auto to_fyers = [](const QString& sym) {
-                return sym.contains(':') ? sym : QStringLiteral("NSE:") + sym + QStringLiteral("-EQ");
+                // Strip any exchange prefix to inspect the bare contract: a held
+                // F&O option arrives as "NFO:NIFTY...CE" (paper) or "NIFTY...CE"
+                // (live) — both must resolve on Fyers' "NSE:" segment, NOT the
+                // equity "...-EQ" form, or the option never gets a live feed.
+                QString core = sym;
+                const int colon = core.indexOf(QLatin1Char(':'));
+                if (colon >= 0)
+                    core = core.mid(colon + 1);
+                if (is_fyers_fno_symbol(core))
+                    return QStringLiteral("NSE:") + core;
+                if (colon >= 0)
+                    return sym;  // already-qualified equity (e.g. "BSE:TCS")
+                return QStringLiteral("NSE:") + core + QStringLiteral("-EQ");
             };
             QStringList fyers_symbols;
             if (!selected_symbol_.isEmpty())
@@ -811,6 +867,16 @@ void AccountDataStream::ws_init() {
             for (const QString& s : subscribed_symbols())
                 fyers_symbols.append(to_fyers(s));
             fyers_symbols.removeDuplicates();
+            {
+                QStringList fno;
+                for (const auto& s : fyers_symbols)
+                    if (is_fyers_fno_symbol(s.section(QLatin1Char(':'), -1)))
+                        fno << s;
+                LOG_INFO("subdbg", QString("[connect] consumers=%1 → %2 fyers syms (F&O: [%3]); raw subscribed=[%4]")
+                                       .arg(subscribed_symbols().size())
+                                       .arg(fyers_symbols.size())
+                                       .arg(fno.join(','), subscribed_symbols().join(',')));
+            }
             if (auto* fws = qobject_cast<FyersWebSocket*>(ws_))
                 fws->subscribe(fyers_symbols);
         });
@@ -897,6 +963,114 @@ void AccountDataStream::ws_init() {
         });
 
         aws->open();
+        return;
+    }
+
+    if (broker_id_ == "zerodha") {
+        auto creds = AccountManager::instance().load_credentials(account_id_);
+        if (creds.api_key.isEmpty() || creds.access_token.isEmpty()) {
+            LOG_WARN(ADS_TAG, QString("Zerodha WS: missing api_key/access_token for %1").arg(account_id_));
+            return;
+        }
+        auto* zws = new ZerodhaWebSocket(creds.api_key, creds.access_token, this);
+        ws_ = zws;
+        connect(zws, &ZerodhaWebSocket::tick_received, this, [this](const ZerodhaTick& tick) {
+            // KiteTicker ticks are keyed by numeric instrument_token — reverse-map
+            // to the normalised symbol via the loaded Zerodha master. Drop ticks we
+            // can't resolve or with a non-positive LTP so a bad map never surfaces a
+            // wrong price under a wrong symbol (quotes fall back to REST instead).
+            auto inst = InstrumentService::instance().find_by_token(tick.instrument_token, broker_id_);
+            if (!inst.has_value() || inst->symbol.isEmpty() || tick.ltp <= 0.0)
+                return;
+            ++ws_tick_count_;
+            BrokerQuote q;
+            q.symbol = inst->symbol;
+            q.ltp = tick.ltp;
+            q.open = tick.open;
+            q.high = tick.high;
+            q.low = tick.low;
+            q.close = tick.close;
+            q.volume = tick.volume;
+            q.change = tick.close > 0 ? tick.ltp - tick.close : 0.0;
+            q.change_pct = tick.close > 0 ? (tick.ltp - tick.close) / tick.close * 100.0 : 0.0;
+            q.oi = tick.oi;
+            q.timestamp = tick.exchange_timestamp.isValid() ? tick.exchange_timestamp.toMSecsSinceEpoch() : 0;
+            // Market depth arrives only on the 184-byte "full" packet (the selected
+            // symbol is subscribed in full mode; the rest stay "quote" for latency).
+            const bool has_depth = tick.bids[0].price > 0.0 || tick.asks[0].price > 0.0;
+            if (has_depth) {
+                q.bid = tick.bids[0].price; // best bid/ask feed the ticker + order matcher
+                q.ask = tick.asks[0].price;
+            }
+            quote_cache_[q.symbol] = q;
+            emit quote_updated(account_id_, q.symbol, q);
+
+            // Publish the 5-level order book for the selected symbol (single-symbol
+            // depth table). Only the full-mode symbol carries depth, so this fires
+            // for it alone; the selected-symbol guard mirrors the Fyers path.
+            if (has_depth && q.symbol.compare(selected_symbol_, Qt::CaseInsensitive) == 0) {
+                QVector<QPair<double, double>> bids, asks;
+                QVector<int> bid_orders, ask_orders;
+                for (const auto& b : tick.bids)
+                    if (b.price > 0.0) { bids.append({b.price, double(b.quantity)}); bid_orders.append(b.orders); }
+                for (const auto& a : tick.asks)
+                    if (a.price > 0.0) { asks.append({a.price, double(a.quantity)}); ask_orders.append(a.orders); }
+                const double best_bid = bids.isEmpty() ? 0.0 : bids.first().first;
+                const double best_ask = asks.isEmpty() ? 0.0 : asks.first().first;
+                double spread = 0.0, spread_pct = 0.0;
+                if (best_bid > 0.0 && best_ask > 0.0) {
+                    spread = best_ask - best_bid;
+                    spread_pct = (spread / best_bid) * 100.0;
+                }
+                LOG_INFO(ADS_TAG, QString("Zerodha WS depth: %1 bids, %2 asks for %3")
+                                      .arg(bids.size()).arg(asks.size()).arg(q.symbol));
+                emit orderbook_fetched(account_id_, bids, asks, spread, spread_pct, bid_orders, ask_orders);
+            }
+        });
+        connect(zws, &ZerodhaWebSocket::connected, this, [this]() {
+            LOG_INFO(ADS_TAG, QString("Zerodha WS connected for %1").arg(account_id_));
+            ws_permission_denied_ = false; // streaming is permitted after all
+            emit connection_state_changed(account_id_, ConnectionState::Connected);
+            ws_resubscribe(); // resolves current symbols → tokens and subscribes
+        });
+        connect(zws, &ZerodhaWebSocket::disconnected, this, [this]() {
+            emit connection_state_changed(account_id_, ConnectionState::Disconnected);
+        });
+        connect(zws, &ZerodhaWebSocket::error_occurred, this, [this](const QString& e) {
+            LOG_ERROR(ADS_TAG, QString("Zerodha WS error: %1").arg(e));
+            // A 403/Forbidden on the KiteTicker handshake is a permission verdict,
+            // not a transient network error: Kite refuses the streaming socket when
+            // the API key has no active Kite Connect (market-data) subscription —
+            // even though the *same* access_token authenticates the REST account
+            // APIs (profile/holdings 200, /quote and ws.kite.trade 403). The retry
+            // loop is futile and otherwise leaves the user staring at blank quote
+            // tables, so surface the cause once via the account's Error state.
+            if (!ws_permission_denied_ &&
+                (e.contains(QStringLiteral("403")) ||
+                 e.contains(QStringLiteral("Forbidden"), Qt::CaseInsensitive))) {
+                ws_permission_denied_ = true;
+                QPointer<AccountDataStream> self = this;
+                QMetaObject::invokeMethod(this, [self]() {
+                    if (!self)
+                        return;
+                    const QString msg = QStringLiteral(
+                        "Live market data unavailable — Kite refused the streaming "
+                        "connection (403). This Kite API key has no active Kite Connect "
+                        "subscription. Account data still works; live quotes and "
+                        "streaming require an active Kite Connect plan for this key.");
+                    AccountManager::instance().set_connection_state(
+                        self->account_id_, ConnectionState::Error, msg);
+                    LOG_WARN(ADS_TAG,
+                             QString("Zerodha streaming denied (403) for %1 — no Kite "
+                                     "Connect market-data subscription for this API key")
+                                 .arg(self->account_id_));
+                    emit self->connection_state_changed(self->account_id_, ConnectionState::Error);
+                }, Qt::QueuedConnection);
+                return;
+            }
+            check_token_expiry(e);
+        });
+        zws->open();
         return;
     }
 
@@ -1139,10 +1313,58 @@ void AccountDataStream::ws_init() {
     auto obj = doc.object();
     const QString feed_token = obj.value("feed_token").toString();
     const QString client_code = obj.value("client_code").toString();
-    if (feed_token.isEmpty() || client_code.isEmpty())
+    if (feed_token.isEmpty() || client_code.isEmpty()) {
+        LOG_WARN(ADS_TAG, QString("AngelOne WS: missing feed_token/client_code for %1").arg(account_id_));
         return;
+    }
 
-    LOG_INFO(ADS_TAG, QString("WebSocket available for account %1 (AngelOne) — deferred to screen wiring").arg(account_id_));
+    auto* aows = new AngelOneWebSocket(creds.api_key, client_code, feed_token, this);
+    ws_ = aows;
+    connect(aows, &AngelOneWebSocket::tick_received, this, [this](const AoTick& tick) {
+        // SmartStream ticks carry a token string (and the adapter may set
+        // tick.symbol). Resolve to a normalised symbol, preferring the adapter's
+        // value, else the master lookup. Drop unresolved / non-positive ticks.
+        QString sym = tick.symbol;
+        if (sym.isEmpty()) {
+            bool ok = false;
+            const quint32 tok = tick.token.toUInt(&ok);
+            if (ok) {
+                auto inst = InstrumentService::instance().find_by_token(tok, broker_id_);
+                if (inst.has_value())
+                    sym = inst->symbol;
+            }
+        }
+        if (sym.isEmpty() || tick.ltp <= 0.0)
+            return;
+        ++ws_tick_count_;
+        BrokerQuote q;
+        q.symbol = sym;
+        q.ltp = tick.ltp;
+        q.open = tick.open;
+        q.high = tick.high;
+        q.low = tick.low;
+        q.close = tick.close;
+        q.volume = static_cast<double>(tick.volume);
+        q.change = tick.close > 0 ? tick.ltp - tick.close : 0.0;
+        q.change_pct = tick.close > 0 ? (tick.ltp - tick.close) / tick.close * 100.0 : 0.0;
+        q.oi = tick.oi;
+        q.timestamp = tick.exchange_timestamp.isValid() ? tick.exchange_timestamp.toMSecsSinceEpoch() : 0;
+        quote_cache_[q.symbol] = q;
+        emit quote_updated(account_id_, q.symbol, q);
+    });
+    connect(aows, &AngelOneWebSocket::connected, this, [this]() {
+        LOG_INFO(ADS_TAG, QString("AngelOne WS connected for %1").arg(account_id_));
+        emit connection_state_changed(account_id_, ConnectionState::Connected);
+        ws_resubscribe(); // resolves current symbols → {token, exchange_type} and subscribes
+    });
+    connect(aows, &AngelOneWebSocket::disconnected, this, [this]() {
+        emit connection_state_changed(account_id_, ConnectionState::Disconnected);
+    });
+    connect(aows, &AngelOneWebSocket::error_occurred, this, [this](const QString& e) {
+        LOG_ERROR(ADS_TAG, QString("AngelOne WS error: %1").arg(e));
+        check_token_expiry(e);
+    });
+    aows->open();
 }
 
 void AccountDataStream::ws_teardown() {
@@ -1161,6 +1383,10 @@ bool AccountDataStream::ws_active() const {
         return fws->is_connected() && ws_tick_count_ > 0;
     if (auto* aws = qobject_cast<AlpacaWebSocket*>(ws_))
         return aws->is_connected() && ws_tick_count_ > 0;
+    if (auto* zws = qobject_cast<ZerodhaWebSocket*>(ws_))
+        return zws->is_connected() && ws_tick_count_ > 0;
+    if (auto* aows = qobject_cast<AngelOneWebSocket*>(ws_))
+        return aows->is_connected() && ws_tick_count_ > 0;
     if (auto* b = qobject_cast<BrokerWebSocketBase*>(ws_))
         return b->is_connected() && ws_tick_count_ > 0;
     return false;
@@ -1175,6 +1401,10 @@ bool AccountDataStream::ws_connected() const {
         return fws->is_connected();
     if (auto* aws = qobject_cast<AlpacaWebSocket*>(ws_))
         return aws->is_connected();
+    if (auto* zws = qobject_cast<ZerodhaWebSocket*>(ws_))
+        return zws->is_connected();
+    if (auto* aows = qobject_cast<AngelOneWebSocket*>(ws_))
+        return aows->is_connected();
     if (auto* b = qobject_cast<BrokerWebSocketBase*>(ws_))
         return b->is_connected();
     return false;
@@ -1183,7 +1413,18 @@ bool AccountDataStream::ws_connected() const {
 void AccountDataStream::ws_resubscribe() {
     if (auto* fws = qobject_cast<FyersWebSocket*>(ws_)) {
         auto to_fyers = [](const QString& sym) {
-            return sym.contains(':') ? sym : QStringLiteral("NSE:") + sym + QStringLiteral("-EQ");
+            // Mirror the connect-handler mapping: strip any exchange prefix and
+            // route F&O options onto Fyers' "NSE:" segment (handles the paper
+            // "NFO:...CE" prefix too), equities to "NSE:<sym>-EQ".
+            QString core = sym;
+            const int colon = core.indexOf(QLatin1Char(':'));
+            if (colon >= 0)
+                core = core.mid(colon + 1);
+            if (is_fyers_fno_symbol(core))
+                return QStringLiteral("NSE:") + core;
+            if (colon >= 0)
+                return sym;
+            return QStringLiteral("NSE:") + core + QStringLiteral("-EQ");
         };
         QStringList fyers_symbols;
         if (!selected_symbol_.isEmpty())
@@ -1191,6 +1432,16 @@ void AccountDataStream::ws_resubscribe() {
         for (const QString& s : subscribed_symbols())
             fyers_symbols.append(to_fyers(s));
         fyers_symbols.removeDuplicates();
+        {
+            QStringList fno;
+            for (const auto& s : fyers_symbols)
+                if (is_fyers_fno_symbol(s.section(QLatin1Char(':'), -1)))
+                    fno << s;
+            LOG_INFO("subdbg", QString("[ws_resubscribe] consumers=%1 → %2 fyers syms (F&O: [%3])")
+                                   .arg(subscribed_symbols().size())
+                                   .arg(fyers_symbols.size())
+                                   .arg(fno.join(',')));
+        }
         fws->set_subscriptions(fyers_symbols);
     }
 
@@ -1203,6 +1454,62 @@ void AccountDataStream::ws_resubscribe() {
                 symbols.append(s);
         }
         aws->set_subscriptions(symbols);
+    }
+
+    // Zerodha KiteTicker — resolve current symbols → numeric instrument tokens.
+    if (auto* zws = qobject_cast<ZerodhaWebSocket*>(ws_)) {
+        QStringList symbols;
+        if (!selected_symbol_.isEmpty())
+            symbols.append(selected_symbol_);
+        for (const QString& s : subscribed_symbols())
+            if (!symbols.contains(s))
+                symbols.append(s);
+        symbols.removeDuplicates();
+        QVector<quint32> tokens;
+        auto& svc = InstrumentService::instance();
+        for (const auto& s : symbols) {
+            const QString exch = (s == selected_symbol_ && !selected_exchange_.isEmpty())
+                                     ? selected_exchange_
+                                     : QStringLiteral("NSE");
+            auto tok = svc.instrument_token(s, exch, broker_id_);
+            if (tok.has_value() && *tok > 0)
+                tokens.append(static_cast<quint32>(*tok));
+        }
+        // Subscribe the selected symbol in "full" mode (5-level depth for the order
+        // book); every other symbol stays "quote" (lighter, no depth) for latency.
+        quint32 sel_token = 0;
+        if (!selected_symbol_.isEmpty()) {
+            const QString exch = selected_exchange_.isEmpty() ? QStringLiteral("NSE") : selected_exchange_;
+            auto t = svc.instrument_token(selected_symbol_, exch, broker_id_);
+            if (t.has_value() && *t > 0)
+                sel_token = static_cast<quint32>(*t);
+        }
+        zws->set_full_mode_token(sel_token);
+        zws->set_subscriptions(tokens);
+        return;
+    }
+
+    // Angel One SmartStream — resolve symbols → {token string, exchange segment}.
+    if (auto* aows = qobject_cast<AngelOneWebSocket*>(ws_)) {
+        QStringList symbols;
+        if (!selected_symbol_.isEmpty())
+            symbols.append(selected_symbol_);
+        for (const QString& s : subscribed_symbols())
+            if (!symbols.contains(s))
+                symbols.append(s);
+        symbols.removeDuplicates();
+        QVector<AngelOneWebSocket::Subscription> subs;
+        auto& svc = InstrumentService::instance();
+        for (const auto& s : symbols) {
+            const QString exch = (s == selected_symbol_ && !selected_exchange_.isEmpty())
+                                     ? selected_exchange_
+                                     : QStringLiteral("NSE");
+            auto tok = svc.instrument_token(s, exch, broker_id_);
+            if (tok.has_value() && *tok > 0)
+                subs.append({QString::number(*tok), ao_exchange_type(exch)});
+        }
+        aows->set_subscriptions(subs);
+        return;
     }
 
     // Generic Phase 2 adapters (shared BrokerWebSocketBase). Rebuild the symbol

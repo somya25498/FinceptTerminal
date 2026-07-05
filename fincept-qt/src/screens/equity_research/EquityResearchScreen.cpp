@@ -15,6 +15,7 @@
 #include "datahub/DataHub.h"
 #include "datahub/DataHubMetaTypes.h"
 #include "trading/AccountManager.h"
+#include "trading/BrokerRegistry.h"
 #include "trading/BrokerTopic.h"
 #include "screens/equity_research/EquityAnalysisTab.h"
 #include "screens/equity_research/EquityFinancialsTab.h"
@@ -22,9 +23,8 @@
 #include "screens/equity_research/EquityOverviewTab.h"
 #include "screens/equity_research/EquityPeersTab.h"
 #include "screens/equity_research/EquitySentimentTab.h"
-#include "screens/equity_research/EquityTalippTab.h"
 #include "screens/equity_research/EquityTechnicalsTab.h"
-
+#include "screens/equity_research/EquityTalippTab.h"
 #include "screens/equity_research/EquityValuationTab.h"
 #include "services/backtesting/BacktestingService.h"
 #include "services/equity/EquityResearchService.h"
@@ -47,6 +47,7 @@
 #include <QMessageBox>
 #include <QPointer>
 #include <QPushButton>
+#include <QTabBar>
 #include <QTextStream>
 #include <QTimeZone>
 #include <QVBoxLayout>
@@ -88,6 +89,18 @@ EquityResearchScreen::EquityResearchScreen(QWidget* parent) : QWidget(parent) {
     connect(&svc, &services::equity::EquityResearchService::financials_loaded,
         this, &EquityResearchScreen::on_financials_loaded);
 
+    // Keep the BUY/SELL buttons in sync as broker accounts connect/disconnect or
+    // are added/removed, so they appear/disappear without needing a tab re-show.
+    auto& am = trading::AccountManager::instance();
+    connect(&am, &trading::AccountManager::connection_state_changed, this,
+            [this](const QString&, trading::ConnectionState) { update_trade_buttons(); });
+    connect(&am, &trading::AccountManager::account_added, this,
+            [this](const QString&) { update_trade_buttons(); });
+    connect(&am, &trading::AccountManager::account_removed, this,
+            [this](const QString&) { update_trade_buttons(); });
+    connect(&am, &trading::AccountManager::account_updated, this,
+            [this](const QString&) { update_trade_buttons(); });
+
     // Listen on the app-wide event bus for "load this symbol" requests
     // from other parts of the app (e.g. the command bar search).
     EventBus::instance().subscribe("equity_research.load_symbol", [this](const QVariantMap& payload) {
@@ -117,6 +130,7 @@ void EquityResearchScreen::showEvent(QShowEvent* e) {
     QWidget::showEvent(e);
     refresh_timer_->start();
     hub_subscribe_broker_quote();
+    update_trade_buttons(); // a broker may have connected since last shown
 }
 
 void EquityResearchScreen::hideEvent(QHideEvent* e) {
@@ -148,7 +162,14 @@ void EquityResearchScreen::build_ui() {
     // ── Tab Widget ───────────────────────────────────────────────────────────
     // QTabWidget is the clickable tabs bar + the content area below it.
     tab_widget_ = new QTabWidget;
-    tab_widget_->setDocumentMode(true);  // cleaner look, no border around pane
+    tab_widget_->setDocumentMode(true);
+
+    // Don't let the style elide tab labels — the macOS tab-bar style hint
+    // defaults to ElideRight, which truncates "OVERVIEW"→"OVERVI…" even when
+    // there's room. Size tabs to their content and only scroll when narrow.
+    tab_widget_->tabBar()->setElideMode(Qt::ElideNone);
+    tab_widget_->tabBar()->setExpanding(false);
+    tab_widget_->setUsesScrollButtons(true);
 
     // Style the tab bar using Qt StyleSheets (similar to CSS)
     tab_widget_->setStyleSheet(QString(R"(
@@ -170,25 +191,23 @@ void EquityResearchScreen::build_ui() {
     financials_tab_ = new EquityFinancialsTab;
     analysis_tab_   = new EquityAnalysisTab;
     technicals_tab_ = new EquityTechnicalsTab;
-    talipp_tab_     = new EquityTalippTab;
-    peers_tab_      = new EquityPeersTab;
-    news_tab_       = new EquityNewsTab;
-    sentiment_tab_  = new EquitySentimentTab;
-    valuation_tab_  = new EquityValuationTab;  // ← our new tab
+    talipp_tab_ = new EquityTalippTab;
+    peers_tab_ = new EquityPeersTab;
+    news_tab_ = new EquityNewsTab;
+    sentiment_tab_ = new EquitySentimentTab;
+    valuation_tab_ = new EquityValuationTab;
 
-    // addTab(widget, label) registers each tab.
-    // We pass empty QString() as label because retranslateUi() sets
-    // the real text — this way tab ORDER never depends on text width.
-    tab_widget_->addTab(overview_tab_,   QString());  // index 0
-    tab_widget_->addTab(financials_tab_, QString());  // index 1
-    tab_widget_->addTab(analysis_tab_,   QString());  // index 2
-    tab_widget_->addTab(technicals_tab_, QString());  // index 3
-    tab_widget_->addTab(talipp_tab_,     QString());  // index 4
-    tab_widget_->addTab(peers_tab_,      QString());  // index 5
-    tab_widget_->addTab(news_tab_,       QString());  // index 6
-    tab_widget_->addTab(sentiment_tab_,  QString());  // index 7
-    tab_widget_->addTab(valuation_tab_,  QString());  // index 8 ← new
-
+    // Tab titles are re-set by retranslateUi(); add with placeholder strings
+    // first so the tab order remains fixed regardless of locale text width.
+    tab_widget_->addTab(overview_tab_,   QString()); // index 0
+    tab_widget_->addTab(financials_tab_, QString()); // index 1
+    tab_widget_->addTab(analysis_tab_,   QString()); // index 2
+    tab_widget_->addTab(technicals_tab_, QString()); // index 3
+    tab_widget_->addTab(talipp_tab_,     QString()); // index 4
+    tab_widget_->addTab(peers_tab_,      QString()); // index 5
+    tab_widget_->addTab(news_tab_,       QString()); // index 6
+    tab_widget_->addTab(sentiment_tab_,  QString()); // index 7
+    tab_widget_->addTab(valuation_tab_,  QString()); // index 8
     // When the user clicks a different tab, call on_tab_changed()
     connect(tab_widget_, &QTabWidget::currentChanged,
             this, &EquityResearchScreen::on_tab_changed);
@@ -231,6 +250,30 @@ QWidget* EquityResearchScreen::build_title_bar() {
         [this]() { return current_symbol(); },
         link_group_);
     hl->addWidget(symbol_label_);
+
+    // BUY / SELL — visible only when a broker is connected (paper or live) and the
+    // current symbol is tradable via the connected (Indian) broker. Clicking opens
+    // the SAME order ticket used in the Equity Trading tab (see on_trade_clicked()).
+    auto make_trade_btn = [&](const QString& text, const QString& color) -> QPushButton* {
+        auto* b = new QPushButton(text, container);
+        b->setCursor(Qt::PointingHandCursor);
+        b->setFixedHeight(24);
+        b->setStyleSheet(
+            QString("QPushButton { background:transparent; color:%1; border:1px solid %1;"
+                    "padding:0 14px; font-size:%2px; font-family:%3; font-weight:700; letter-spacing:1px; }"
+                    "QPushButton:hover { background:%1; color:%4; }")
+                .arg(color)
+                .arg(ui::fonts::TINY)
+                .arg(ui::fonts::DATA_FAMILY)
+                .arg(ui::colors::BG_BASE()));
+        b->setVisible(false);
+        hl->addWidget(b);
+        return b;
+    };
+    buy_btn_ = make_trade_btn(tr("BUY"), ui::colors::POSITIVE());
+    sell_btn_ = make_trade_btn(tr("SELL"), ui::colors::NEGATIVE());
+    connect(buy_btn_, &QPushButton::clicked, this, [this]() { on_trade_clicked(true); });
+    connect(sell_btn_, &QPushButton::clicked, this, [this]() { on_trade_clicked(false); });
 
     // BACKTEST button — sends user to the backtesting screen with this symbol
     auto* backtest_btn = new QPushButton(tr("BACKTEST"), container);
@@ -387,16 +430,13 @@ void EquityResearchScreen::on_tab_changed(int index) {
             svc.fetch_technicals(current_symbol_);
             break;
         case 4:
-            talipp_tab_->set_symbol(current_symbol_);
-            break;
-        case 5:
             peers_tab_->set_symbol(current_symbol_);
             break;
-        case 6:
+        case 5:
+            // News tab owns its own fetch (provider-aware) via set_symbol().
             news_tab_->set_symbol(current_symbol_);
-            svc.fetch_news(current_symbol_);
             break;
-        case 7:
+        case 6:
             sentiment_tab_->set_symbol(current_symbol_);
             break;
         case 8:
@@ -420,11 +460,13 @@ void EquityResearchScreen::load_symbol(const QString& symbol) {
     if (symbol.isEmpty() || symbol == current_symbol_)
         return;
     current_symbol_ = symbol;
+    last_price_ = 0.0; // stale until the new symbol's quote arrives
 
     // Update the text in title bar and quote bar immediately
     symbol_label_->setText(symbol);
     sym_label_->setText(symbol);
     price_label_->setText(tr("Loading…"));
+    update_trade_buttons(); // a new symbol may (un)hide BUY/SELL
 
     // Overview tab always refreshes (it's the default landing tab)
     overview_tab_->set_symbol(symbol);
@@ -468,6 +510,11 @@ SymbolRef EquityResearchScreen::current_symbol() const {
 void EquityResearchScreen::update_quote_bar(const services::equity::QuoteData& q) {
     if (q.symbol != current_symbol_)
         return;
+
+    // Cache the freshest price (both the yfinance poll and the live broker stream
+    // funnel through here) so a BUY/SELL ticket can seed it for paper market fills.
+    if (q.price > 0.0)
+        last_price_ = q.price;
 
     const QString cs = EquityOverviewTab::currency_symbol(
         current_currency_.isEmpty() ? "USD" : current_currency_);
@@ -677,7 +724,7 @@ void EquityResearchScreen::retranslateUi() {
         tab_widget_->setTabText(5, tr("Peers"));
         tab_widget_->setTabText(6, tr("News"));
         tab_widget_->setTabText(7, tr("Sentiment"));
-        tab_widget_->setTabText(8, tr("Valuation"));  // ← our new tab label
+        tab_widget_->setTabText(8, tr("Valuation"));
     }
 }
 
@@ -692,10 +739,16 @@ QVariantMap EquityResearchScreen::save_state() const {
         {"tab_index", tab_widget_ ? tab_widget_->currentIndex() : 0}
     };
     if (peers_tab_) state["peers"] = peers_tab_->peers_text();
+    if (news_tab_) state["news_provider"] = news_tab_->provider_key();
     return state;
 }
 
 void EquityResearchScreen::restore_state(const QVariantMap& state) {
+    // Apply the saved news provider BEFORE load_symbol so the News tab's first
+    // fetch (if it's the active tab) uses the restored provider.
+    if (news_tab_ && state.contains("news_provider"))
+        news_tab_->set_provider_key(state.value("news_provider").toString());
+
     const QString sym = state.value("symbol").toString();
     if (!sym.isEmpty()) {
         current_symbol_.clear();
@@ -723,20 +776,28 @@ void EquityResearchScreen::hub_subscribe_broker_quote() {
         !current_symbol_.endsWith(QStringLiteral(".BO")))
         return;
 
+// Find a connected Indian-region broker account (any — not only Fyers). NSE/
+// BSE quotes stream through whichever Indian broker the user has live;
+// hardcoding "fyers" left every other connected broker (Zerodha, Upstox,
+// AngelOne, …) without research quotes. Pick the first Connected IN broker.
     const auto accounts = trading::AccountManager::instance().active_accounts();
-    QString fyers_account_id;
+    QString quote_broker_id, quote_account_id;
     for (const auto& a : accounts) {
-        if (a.broker_id == QStringLiteral("fyers") &&
-            a.state == trading::ConnectionState::Connected) {
-            fyers_account_id = a.account_id;
+        if (a.state != trading::ConnectionState::Connected)
+            continue;
+        auto* b = trading::BrokerRegistry::instance().get(a.broker_id);
+        if (b && b->profile().region == QLatin1String("IN")) {
+            quote_broker_id = a.broker_id;
+            quote_account_id = a.account_id;
             break;
         }
     }
-    if (fyers_account_id.isEmpty()) return;
+    if (quote_account_id.isEmpty())
+        return;
 
     QString broker_sym = current_symbol_.left(current_symbol_.length() - 3);
     const QString topic = trading::broker_topic(
-        QStringLiteral("fyers"), fyers_account_id, QStringLiteral("quote"), broker_sym);
+        quote_broker_id, quote_account_id, QStringLiteral("quote"), broker_sym);
     const QString sym = current_symbol_;
 
     datahub::DataHub::instance().subscribe(this, topic, [this, sym](const QVariant& v) {
@@ -768,6 +829,124 @@ void EquityResearchScreen::hub_unsubscribe_broker_quote() {
 void EquityResearchScreen::on_financials_loaded(services::equity::FinancialsData data) {
     if (valuation_tab_)
         valuation_tab_->set_financials(data);
+}
+// ── In-tab trading ──────────────────────────────────────────────────────────
+
+// Resolve a yfinance research symbol to a broker-tradable route, matched against
+// any broker's BrokerProfile.exchanges (works for every region — not a hardcoded
+// IN/US split). `match_exchanges` is the set a broker must serve to trade it;
+// `order_exchange` is what to put on the order (definite for single-venue markets,
+// empty for US where the broker routes by symbol and we can't tell NYSE/NASDAQ
+// apart). Unknown/forex symbols → not routable.
+struct ResearchTradeRoute {
+    QString bare;
+    QString order_exchange;
+    QStringList match_exchanges;
+    bool routable = false;
+};
+
+static ResearchTradeRoute research_trade_route(const QString& sym) {
+    ResearchTradeRoute r;
+    r.bare = sym;
+
+    struct Suffix {
+        const char* suffix;
+        const char* exchange;
+    };
+    static const Suffix kSuffixes[] = {
+        {".NS", "NSE"},
+        {".BO", "BSE"},
+        {".L", "LSE"},
+        {".TO", "TSX"},
+        {".HK", "HKEX"},
+        {".DE", "XETRA"},
+        {".PA", "EURONEXT"},
+        {".AS", "EURONEXT"},
+        {".SW", "SIX"},
+    };
+
+    for (const auto& s : kSuffixes) {
+        const QString suffix = QLatin1String(s.suffix);
+        if (sym.endsWith(suffix, Qt::CaseInsensitive)) {
+            r.bare = sym.left(sym.length() - suffix.length());
+            r.order_exchange = QLatin1String(s.exchange);
+            r.match_exchanges = {r.order_exchange};
+            r.routable = true;
+            return r;
+        }
+    }
+
+    if (!sym.contains('.')) {
+        r.match_exchanges = {
+            "NYSE",
+            "NASDAQ",
+            "AMEX",
+            "ARCA",
+            "BATS",
+            "CBOE"
+        };
+        r.routable = true;
+        return r;
+    }
+
+    return r;
+}
+
+static bool any_usable_broker_trades(const QStringList& match_exchanges) {
+    if (match_exchanges.isEmpty())
+        return false;
+
+    for (const auto& a : trading::AccountManager::instance().list_accounts()) {
+        if (!a.is_active)
+            continue;
+
+        if (!(a.trading_mode == "paper" ||
+              a.state == trading::ConnectionState::Connected))
+            continue;
+
+        auto* b = trading::BrokerRegistry::instance().get(a.broker_id);
+        if (!b)
+            continue;
+
+        const QStringList exchanges = b->profile().exchanges;
+        for (const auto& me : match_exchanges)
+            if (exchanges.contains(me, Qt::CaseInsensitive))
+                return true;
+    }
+
+    return false;
+}
+
+void EquityResearchScreen::update_trade_buttons() {
+    if (!buy_btn_ || !sell_btn_)
+        return;
+
+    const auto route = research_trade_route(current_symbol_);
+    const bool show =
+        route.routable &&
+        any_usable_broker_trades(route.match_exchanges);
+
+    buy_btn_->setVisible(show);
+    sell_btn_->setVisible(show);
+}
+
+void EquityResearchScreen::on_trade_clicked(bool is_buy) {
+    if (current_symbol_.isEmpty())
+        return;
+
+    const auto route = research_trade_route(current_symbol_);
+    if (!route.routable)
+        return;
+
+    EventBus::instance().publish(
+        "equity.open_order_ticket",
+        {
+            {"symbol", route.bare},
+            {"exchange", route.order_exchange},
+            {"match_exchanges", route.match_exchanges},
+            {"is_buy", is_buy},
+            {"price", last_price_},
+        });
 }
 
 } // namespace fincept::screens

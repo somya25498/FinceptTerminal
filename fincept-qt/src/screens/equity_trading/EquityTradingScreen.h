@@ -31,6 +31,10 @@ namespace fincept::feeds {
 class FeedPanel;
 }
 
+namespace fincept::screens {
+class PortfolioMonitorScreen;
+}
+
 namespace fincept::screens::equity {
 class EquityTickerBar;
 class EquityWatchlist;
@@ -61,6 +65,20 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     void restore_state(const QVariantMap& state) override;
     QString state_key() const override { return QStringLiteral("equity_trading"); }
 
+    // External entry point — opens the SAME quick order ticket used in-screen for
+    // an arbitrary symbol/side, driven from another screen (e.g. Equity Research).
+    // Ensures a broker account is focused (the credential-aware pick this tab uses
+    // on show) and seeds a reference price the caller already has, so paper market
+    // orders fill even when this screen's own quote stream hasn't ticked for the
+    // symbol. The trading tab's own symbol selection is saved and restored, so this
+    // never disturbs an in-progress trade here. Reuses open_order_ticket_for() +
+    // on_order_submitted() — no duplicate form, no duplicate placement logic.
+    // match_exchanges are the broker exchanges that can trade the symbol's market
+    // (e.g. {"NSE"} or the US venues); the order routes to a usable account whose
+    // broker serves one of them, so multi-broker setups pick the right account.
+    void open_external_order_ticket(const QString& symbol, const QString& exchange,
+                                    const QStringList& match_exchanges, bool is_buy, double ref_price);
+
   protected:
     void showEvent(QShowEvent* event) override;
     void hideEvent(QHideEvent* event) override;
@@ -76,20 +94,31 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     void on_accounts_clicked(); // opens AccountManagementDialog
     void handle_token_expired(const QString& account_id);
     void on_order_submitted(const trading::UnifiedOrder& order);
+    // Inline multi-broker submit: confirm, gate per account (Semi-Auto), then
+    // broadcast the same order to every selected account on a worker thread.
+    void on_multi_broker_submit(const trading::UnifiedOrder& order, const QStringList& account_ids);
     void on_cancel_order(const QString& order_id);
     void on_cancel_all_orders();                                          // CANCEL ALL ORDERS button
-    void on_close_all_positions();                                        // SQUARE OFF ALL button
+    void on_close_all_positions();                                        // SQUARE OFF ALL button (positions)
+    // SQUARE OFF ALL button on the Holdings tab — market-sells every holding
+    // (CNC/delivery). Acts ONLY on holdings; positions are untouched.
+    void on_square_off_all_holdings(const QVector<trading::BrokerHolding>& holdings);
+    // Per-row SELL on the Holdings tab — confirm then close that single holding.
+    void on_square_off_holding(const QString& symbol, const QString& exchange);
     void on_strategy_submitted(const trading::BasketOrderRequest& basket); // options strategy → basket
     void on_ob_price_clicked(double price);
     void on_import_holdings_requested(const QVector<trading::BrokerHolding>& holdings);
+    // Replicate a source account's portfolio into a paper account (opens dialog).
+    void on_replicate_portfolio_requested();
     // Paper: convert a position's product in place (MIS -> CNC) then refresh.
     void on_convert_position(const QString& position_id, const QString& symbol, const QString& new_product);
     // Orders tab date-selector changed — show that IST day's paper order book.
     void on_orders_day_changed(const QDate& day);
     // Square off the subset of open positions by P&L sign (+1 winners, -1 losers).
     void on_square_off_group(const QString& account_id, int sign);
-    // Right-click Buy/Sell on a position or holding → open an order ticket.
-    void on_trade_symbol_requested(const QString& symbol, const QString& product, bool is_buy);
+    // Buy/Sell on a position or holding (right-click or per-row SELL button) →
+    // open an order ticket. `qty` pre-fills the ticket (held qty on a reduce/exit).
+    void on_trade_symbol_requested(const QString& symbol, const QString& product, bool is_buy, double qty);
     // EXIT clicked on the chart's position card → confirm + square off the symbol.
     void on_chart_exit_position(const QString& symbol, const QString& exchange,
                                 const QString& product_type, const QString& side, double qty);
@@ -149,7 +178,12 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     void open_chart_order_ticket(bool is_buy, double price);
     // Generalized order ticket for an arbitrary symbol/product (right-click trade
     // from the positions/holdings tables). Routes through on_order_submitted().
-    void open_order_ticket_for(const QString& symbol, const QString& exchange, const QString& product, bool is_buy);
+    void open_order_ticket_for(const QString& symbol, const QString& exchange, const QString& product, bool is_buy,
+                               double qty = 0.0);
+    // Pick a usable account (paper, or live + Connected) whose broker can trade one
+    // of `match_exchanges` (broker.exchanges ∩ match). Prefers the already-focused
+    // account, then a live match, then a paper match. Empty when nothing matches.
+    QString pick_account_for_exchanges(const QStringList& match) const;
     // Re-reads the focused account's paper portfolio into the panels. No-op for
     // live accounts (their data flows from AccountDataStream via the hub).
     void refresh_paper_panels();
@@ -161,16 +195,27 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     void hub_subscribe_quotes();
     QString broker_id_for_focused() const;
 
+    // Mark held F&O option positions to market. Fyers' live HSM tick feed spells
+    // an option ("NIFTY09JUN26C23200") differently from its REST position symbol
+    // ("NIFTY2660923200CE"), so option ticks never match the per-symbol quote
+    // topics. This router reconciles the two by (underlying, strike, side) and
+    // patches the position/holding row + paper P&L. Bound to the focused stream
+    // (opt_quote_conn_) only while an option position is actually held.
+    void route_option_quote(const QString& account_id, const QString& symbol,
+                            const trading::BrokerQuote& quote);
+
     // Named-watchlist controller (WatchlistRepository). load_watchlists() refreshes
     // the combo + seeds a default from the broker's default_watchlist on first run;
     // apply_active_watchlist() pushes the active list's symbols into the view and
     // (when resubscribe=true) re-points the live stream + hub at the new symbol set.
     void load_watchlists();
     void apply_active_watchlist(bool resubscribe);
-    // Effective live-subscription set = active watchlist ∪ open-position symbols,
-    // so symbols you hold (even if not in the list) get live WebSocket prices.
+    // Effective live-subscription set = active watchlist ∪ open-position symbols
+    // ∪ holding symbols, so symbols you hold (even if not in the list) get live
+    // WebSocket prices instead of only the 5-minute REST portfolio snapshot.
     QStringList effective_symbols() const;
     void update_position_symbols(const QStringList& syms); // re-subscribe when it changes
+    void update_holding_symbols(const QStringList& syms);  // re-subscribe when it changes
     // Push the open position for the displayed symbol onto the chart's overlay
     // card + entry line (from the live cache or the paper engine), or clear it
     // when the symbol is flat.
@@ -194,6 +239,7 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     QHash<QString, QString> symbol_suggestion_map_;
     QPushButton* mode_btn_ = nullptr;
     QPushButton* feeds_btn_ = nullptr;    // toggles the far-right feed monitor column
+    QPushButton* unified_btn_ = nullptr;  // toggles the all-accounts portfolio monitor column
     QPushButton* accounts_btn_ = nullptr; // opens AccountManagementDialog
     QLabel* exchange_label_ = nullptr;
     QLabel* clock_label_ = nullptr;
@@ -207,6 +253,18 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     equity::EquityOrderBook* orderbook_ = nullptr;
     equity::EquityBottomPanel* bottom_panel_ = nullptr;
     fincept::feeds::FeedPanel* feed_panel_ = nullptr; // collapsible far-right feed column
+    PortfolioMonitorScreen* monitor_panel_ = nullptr; // collapsible all-accounts portfolio column
+    QWidget* monitor_float_ = nullptr;                // top-level window while the monitor is detached
+
+    void float_monitor();  // reparent monitor_panel_ into its own window
+    void redock_monitor(); // bring it back into the splitter (slot 4)
+
+  protected:
+    // Watches monitor_float_ for Close to re-dock the monitor (feeds pattern,
+    // without a dedicated moc'd window class).
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
+  private:
     QSplitter* main_splitter_ = nullptr;              // kept to toggle the feed column width
 
     // ── Timers (only UI-local timers remain; data timers are in AccountDataStream) ──
@@ -234,6 +292,9 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     // UPDATE per tick. SL/TP + limit matching still run every tick (in-memory).
     QHash<QString, double> pending_paper_prices_;
     bool paper_flush_armed_ = false;
+    // Focused stream → route_option_quote, bound only while an F&O option position
+    // is held (Fyers' HSM tick symbol can't match the per-symbol quote topics).
+    QMetaObject::Connection opt_quote_conn_;
 
     // Async guards
     std::atomic<bool> token_expired_shown_{false};
@@ -244,6 +305,7 @@ class EquityTradingScreen : public QWidget, public IGroupLinked, public IStatefu
     // moves it to view a past IST session). Open positions/holdings stay current.
     QDate orders_view_day_ = QDate::currentDate();
     QStringList position_symbols_; // symbols with open positions (transient, for live pricing)
+    QStringList holding_symbols_;  // symbols in holdings (transient, for live pricing)
     QVector<trading::BrokerPosition> live_positions_; // cached live positions for focused account
     double current_price_ = 0.0;  // last known LTP for selected symbol
 

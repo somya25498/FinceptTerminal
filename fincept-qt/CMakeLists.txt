@@ -33,7 +33,7 @@ if(WIN32 AND CMAKE_HOST_WIN32)
     unset(_fincept_sdk_dirs)
 endif()
 
-project(FinceptTerminal VERSION 4.0.3 LANGUAGES C CXX)
+project(FinceptTerminal VERSION 4.1.0 LANGUAGES C CXX)
 
 # Strip C/C++ flags out of RC invocations — rc.exe only understands /D, /I, /fo.
 if(WIN32)
@@ -164,9 +164,21 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Build performance ─────────────────────────────────────────────────────────
-# Unity build for infrastructure layers (safe — no local symbol conflicts)
-# Screens are excluded below via SKIP_UNITY_BUILD_INCLUSION (too many local statics/functions)
-set(CMAKE_UNITY_BUILD ON)
+# Developer iteration build. Set ON by the `win-dev` preset. Flips unity build
+# OFF (so a single-file edit recompiles only that file, not its 20-file bundle)
+# and enables /DEBUG:FASTLINK below for much faster incremental links. Release
+# builds (Release/linux/macos presets) leave this OFF for the smaller, faster
+# binary that unity + full PDB linking produce.
+option(FINCEPT_DEV_BUILD "Developer iteration build: unity OFF + FASTLINK for fast single-file rebuilds" OFF)
+
+# Unity build for infrastructure layers (safe — no local symbol conflicts).
+# Screens are excluded below via SKIP_UNITY_BUILD_INCLUSION (too many local statics/functions).
+# Disabled in dev builds so a one-line edit only recompiles that translation unit.
+if(FINCEPT_DEV_BUILD)
+    set(CMAKE_UNITY_BUILD OFF)
+else()
+    set(CMAKE_UNITY_BUILD ON)
+endif()
 set(CMAKE_UNITY_BUILD_BATCH_SIZE 20)
 
 # FetchContent: default to skipping the update step after first download to cut
@@ -189,6 +201,70 @@ if(DEFINED ENV{CI})
     set(FINCEPT_ENABLE_LTO ON CACHE BOOL "" FORCE)
 endif()
 
+# ── Build concurrency cap (RAM-aware) ────────────────────────────────────────
+# THE most important knob on a memory-constrained machine, and the fix for
+# "the build hangs my whole computer". Ninja defaults to one compile job per
+# logical core. Each MSVC Qt/C++20 translation unit peaks at ~1.2-1.6 GB
+# (non-unity dev) up to ~3-4 GB (unity Release, batch 20) of RAM. Running one
+# per core (e.g. 12 on a 6c/12t laptop) therefore demands 15-48 GB; on a box
+# with ~16 GB the kernel spills to the pagefile and the ENTIRE MACHINE stalls,
+# not just the build. The linker is hungrier still and must never run two at
+# once.
+#
+# Ninja "job pools" cap concurrency independently of the -j the caller passes,
+# so the limit holds from a bare `cmake --build`, an IDE, or CI alike. We size
+# the compile pool from physical RAM: reserve headroom for the OS + (on AMD
+# APUs) the iGPU's shared carve-out + the linker, then divide the remainder by
+# a per-job RAM budget that depends on whether unity is on. Auto-sizing means a
+# 64 GB workstation still gets full core utilisation while a 16 GB laptop stops
+# thrashing. Override explicitly with -DFINCEPT_MAX_COMPILE_JOBS=N (>=1).
+if(CMAKE_GENERATOR MATCHES "Ninja")
+    cmake_host_system_information(RESULT _fincept_ram_mb    QUERY TOTAL_PHYSICAL_MEMORY)
+    cmake_host_system_information(RESULT _fincept_ncores    QUERY NUMBER_OF_LOGICAL_CORES)
+
+    # Per-compile RAM budget (MB). Unity TUs bundle up to BATCH_SIZE files into a
+    # single cl.exe and need far more headroom than a lone non-unity dev TU.
+    if(FINCEPT_DEV_BUILD)
+        set(_fincept_mb_per_job 2048)   # non-unity, /Z7, PCH
+    else()
+        set(_fincept_mb_per_job 3072)   # unity batch 20 + optimiser
+    endif()
+
+    # RAM kept free for the OS, background apps, the iGPU shared pool, and the
+    # link step (which runs concurrently with the tail of the compile phase).
+    set(_fincept_ram_reserve_mb 5120)
+
+    if(_fincept_ram_mb GREATER _fincept_ram_reserve_mb)
+        math(EXPR _fincept_ram_jobs
+             "(${_fincept_ram_mb} - ${_fincept_ram_reserve_mb}) / ${_fincept_mb_per_job}")
+    else()
+        set(_fincept_ram_jobs 1)
+    endif()
+
+    # Clamp to [2, logical cores]: never serialise to 1 on a healthy box, never
+    # oversubscribe past the core count even when RAM is plentiful.
+    if(_fincept_ram_jobs LESS 2)
+        set(_fincept_ram_jobs 2)
+    endif()
+    if(_fincept_ram_jobs GREATER _fincept_ncores)
+        set(_fincept_ram_jobs ${_fincept_ncores})
+    endif()
+
+    set(FINCEPT_MAX_COMPILE_JOBS "${_fincept_ram_jobs}" CACHE STRING
+        "Max concurrent compile jobs (Ninja job pool). Auto-sized from RAM; override to taste.")
+
+    set_property(GLOBAL PROPERTY JOB_POOLS
+        fincept_compile_pool=${FINCEPT_MAX_COMPILE_JOBS}
+        fincept_link_pool=1)
+    set(CMAKE_JOB_POOL_COMPILE fincept_compile_pool)
+    set(CMAKE_JOB_POOL_LINK    fincept_link_pool)
+
+    message(STATUS
+        "Build concurrency cap: ${FINCEPT_MAX_COMPILE_JOBS} compile job(s) + 1 link "
+        "(host ${_fincept_ram_mb} MB RAM / ${_fincept_ncores} cores, "
+        "${_fincept_mb_per_job} MB per-job budget). Override: -DFINCEPT_MAX_COMPILE_JOBS=N")
+endif()
+
 # MSVC compiler flags for maximum build throughput:
 #   /Z7        — embed debug info in .obj instead of shared PDB → no PDB write
 #                contention (major speedup with parallel compilation)
@@ -205,6 +281,15 @@ if(MSVC)
     # /W4          : level-4 warnings (highest practical without /Wall noise)
     # /WX only in CI so local iteration isn't blocked by new warnings
     add_compile_options(/Z7 /Oi /bigobj /permissive- /W4)
+    # Suppress /W4 warnings that have NO -Wall/-Wextra equivalent on GCC/Clang, so
+    # all three compilers enforce a consistent policy under -Werror/-WX:
+    #   C4456-C4459 = variable shadowing (GCC/Clang's -Wshadow, deliberately NOT in
+    #                 -Wall -Wextra — pervasive/benign in Qt code, e.g. a local
+    #                 'data' hiding QWidget::data, or 'self'/'w' shadowing a local).
+    #   C4804       = bool used in a comparison (e.g. the Qt6 idiom
+    #                 `QHash::remove(k) > 0`, where remove() now returns bool).
+    # These are style, not bugs — the same code compiles clean under GCC/Clang.
+    add_compile_options(/wd4456 /wd4457 /wd4458 /wd4459 /wd4804)
     if(DEFINED ENV{CI})
         add_compile_options(/WX)
     endif()
@@ -230,6 +315,14 @@ if(MSVC)
         # /INCREMENTAL:NO; override here.
         add_link_options($<$<CONFIG:Release>:/INCREMENTAL>)
         add_link_options($<$<CONFIG:RelWithDebInfo>:/INCREMENTAL>)
+        # Dev iteration: /DEBUG:FASTLINK keeps debug info in the .obj files and
+        # builds a thin PDB that references them rather than copying it all in.
+        # This is the single biggest lever on incremental link wall-clock for a
+        # 400+ object target. The objects must stay on disk (fine for a dev tree).
+        # Release builds keep the default full PDB (portable, no obj dependency).
+        if(FINCEPT_DEV_BUILD)
+            add_link_options($<$<CONFIG:RelWithDebInfo>:/DEBUG:FASTLINK>)
+        endif()
         # Replace any /INCREMENTAL:NO that CMake's defaults inserted.
         foreach(flag_var
                 CMAKE_EXE_LINKER_FLAGS_RELEASE
@@ -690,6 +783,7 @@ set(CORE_SOURCES
     src/core/events/EventBus.cpp
     src/core/HealthMonitor.cpp
     src/core/layout/LayoutTypes.cpp
+    src/core/layout/DockLayoutSelftest.cpp
     src/core/layout/LayoutCatalog.cpp
     src/core/layout/LayoutTemplates.cpp
     src/core/layout/WorkspaceMatcher.cpp
@@ -741,6 +835,7 @@ set(DATAHUB_SOURCES
 set(AUTH_SOURCES
     src/auth/AuthManager.cpp
     src/auth/AuthApi.cpp
+    src/auth/GoogleDesktopLogin.cpp
     src/auth/UserApi.cpp
     src/auth/SessionGuard.cpp
     src/auth/PinManager.cpp
@@ -812,6 +907,7 @@ set(STORAGE_SOURCES
     src/storage/repositories/CustomIndexRepository.cpp
     src/storage/repositories/DataMappingRepository.cpp
     src/storage/repositories/AccountRepository.cpp
+    src/storage/repositories/OrderBasketRepository.cpp
 
     # Workflow migration
     src/storage/sqlite/migrations/v008_workflows.cpp
@@ -867,6 +963,12 @@ set(STORAGE_SOURCES
     src/storage/sqlite/migrations/v042_scan_watch_events.cpp
     src/storage/sqlite/migrations/v043_feed_subscriptions.cpp
     src/storage/sqlite/migrations/v044_feed_items.cpp
+    src/storage/sqlite/migrations/v045_scan_watch_universe.cpp
+    src/storage/sqlite/migrations/v046_fno_algo.cpp
+    src/storage/sqlite/migrations/v047_algo_multileg_trades.cpp
+    src/storage/sqlite/migrations/v048_instruments_exchange_unique.cpp
+    src/storage/sqlite/migrations/v049_order_baskets.cpp
+    src/storage/sqlite/migrations/v050_alpha_arena_rewrite.cpp
 
     # Historical OHLCV data store (Historify, Phase 3 §13)
     src/storage/HistoricalDataStore.cpp
@@ -895,6 +997,7 @@ set(LLM_SERVICE_SOURCES
     src/services/llm/LlmFinceptAsync.cpp
     src/services/llm/LlmToolLoop.cpp
     src/services/llm/ModelCatalog.cpp
+    src/services/llm/ProviderCatalog.cpp
 )
 
 # AI Chat screen — UI for chatting with the LLM service
@@ -972,9 +1075,15 @@ set(MCP_SOURCES
 # Trading
 set(TRADING_SOURCES
     src/trading/PaperTrading.cpp
+    src/trading/PaperTradingSelftest.cpp
+    src/trading/replication/PortfolioReplicationService.cpp
+    src/trading/replication/PortfolioReplicationSelftest.cpp
+    src/trading/PaperMarkService.cpp
     src/trading/OrderMatcher.cpp
     src/trading/BrokerRegistry.cpp
     src/trading/UnifiedTrading.cpp
+    src/trading/UnifiedPortfolioService.cpp
+    src/trading/PortfolioMonitorSelftest.cpp
     src/trading/SmartOrderEngine.cpp
     src/trading/RateLimiter.cpp
     src/trading/ActionCenter.cpp
@@ -1084,7 +1193,15 @@ set(ALGO_ENGINE_SOURCES
     src/algo_engine/AlgoScanner.cpp
     src/algo_engine/CandleDataFetcher.cpp
     src/algo_engine/ScanMonitor.cpp
+    src/algo_engine/RealtimeScanRunner.cpp
+    src/algo_engine/UniverseScanSelftest.cpp
     src/algo_engine/BacktestEngine.cpp
+    src/algo_engine/fno/FnoAlgoTypes.cpp
+    src/algo_engine/fno/FnoAlgoSelftest.cpp
+    src/algo_engine/fno/FnoLegResolver.cpp
+    src/algo_engine/fno/FnoStrategyPreview.cpp
+    src/algo_engine/fno/FnoDataBridge.cpp
+    src/algo_engine/fno/FnoExecution.cpp
 )
 
 # Services
@@ -1103,18 +1220,20 @@ set(SERVICE_SOURCES
     src/services/cloud/NewsFeedCloudAdapter.cpp
     src/services/cloud/NotebookCloudAdapter.cpp
     src/services/akshare/AkShareService.cpp
-    src/services/alpha_arena/AlphaArenaJson.cpp
-    src/services/alpha_arena/Indicators.cpp
-    src/services/alpha_arena/ContextBuilder.cpp
-    src/services/alpha_arena/AlphaArenaRepo.cpp
-    src/services/alpha_arena/RiskEngine.cpp
-    src/services/alpha_arena/PaperVenue.cpp
-    src/services/alpha_arena/SecretRedemptionServer.cpp
-    src/services/alpha_arena/TickClock.cpp
-    src/services/alpha_arena/ModelDispatcher.cpp
-    src/services/alpha_arena/OrderRouter.cpp
-    src/services/alpha_arena/AlphaArenaEngine.cpp
-    src/services/alpha_arena/AlphaArenaService.cpp
+    src/services/alpha_arena/ArenaStore.cpp
+    src/services/alpha_arena/ArenaIndicators.cpp
+    src/services/alpha_arena/ArenaDecisionParser.cpp
+    src/services/alpha_arena/PaperExchange.cpp
+    src/services/alpha_arena/ArenaRisk.cpp
+    src/services/alpha_arena/ArenaModelRegistry.cpp
+    src/services/alpha_arena/ArenaPrompts.cpp
+    src/services/alpha_arena/ArenaLlmClient.cpp
+    src/services/alpha_arena/ArenaMarketData.cpp
+    src/services/alpha_arena/ArenaEngine.cpp
+    src/services/alpha_arena/HyperliquidLiveVenue.cpp
+    # Header-only Q_OBJECT interface — listed so AUTOMOC scans it (no sibling .cpp).
+    src/services/alpha_arena/ArenaMarketDataIface.h
+    src/services/alpha_arena/ArenaSelftest.cpp
     src/services/asia_markets/AsiaMarketsService.cpp
     src/services/crypto/TotpService.cpp
     src/services/python_cli/PythonCliService.cpp
@@ -1149,6 +1268,7 @@ set(SERVICE_SOURCES
     src/services/dbnomics/DBnomicsService.cpp
     src/services/gov_data/GovDataService.cpp
     src/services/equity/EquityResearchService.cpp
+    src/services/equity/EquitySentimentService.cpp
     src/services/equity/MarketSentimentService.cpp
     src/services/equity/MarketSentimentSupport.cpp
     src/services/ma_analytics/MAAnalyticsService.cpp
@@ -1358,6 +1478,7 @@ set(UI_SOURCES
     src/ui/widgets/algo/RiskManagementPanel.cpp
     src/ui/widgets/algo/SymbolSearchCombo.cpp
     src/ui/widgets/algo/SymbolChipInput.cpp
+    src/ui/widgets/algo/FnoLegRuleEditor.cpp
 )
 
 # Screens
@@ -1521,9 +1642,13 @@ set(SCREEN_SOURCES
     src/screens/equity_trading/EquityOrderEntry.cpp
     src/screens/equity_trading/EquityOrderBook.cpp
     src/screens/equity_trading/EquityBottomPanel.cpp
+    src/screens/common/PaperBlotterPanel.cpp
     src/screens/equity_trading/AccountManagementDialog.cpp
     src/screens/equity_trading/BroadcastOrderDialog.cpp
+    src/screens/equity_trading/BasketOrdersDialog.cpp
     src/screens/equity_trading/OrderConfirmDialog.cpp
+    src/screens/equity_trading/PortfolioReplicationDialog.cpp
+    src/screens/portfolio_monitor/PortfolioMonitorScreen.cpp
     # Feed monitor (reusable across screens)
     src/screens/common/feeds/FeedCardView.cpp
     src/screens/common/feeds/FeedTableView.cpp
@@ -1677,6 +1802,7 @@ set(SCREEN_SOURCES
     src/screens/algo_trading/StrategyBuilderPanel.cpp
     src/screens/algo_trading/StrategyListPanel.cpp
     src/screens/algo_trading/ScannerPanel.cpp
+    src/screens/algo_trading/UniverseScannerPanel.cpp
     src/screens/algo_trading/AlertsPanel.cpp
     src/screens/algo_trading/DeploymentDashboard.cpp
     src/screens/algo_trading/AlgoDeployDialog.cpp
@@ -1739,9 +1865,10 @@ set(SCREEN_SOURCES
 
     # Alpha Arena
     src/screens/alpha_arena/AlphaArenaScreen.cpp
-    src/screens/alpha_arena/panels/LeaderboardPanel.cpp
-    src/screens/alpha_arena/panels/ModelChatPanel.cpp
-    src/screens/alpha_arena/panels/StatePanels.cpp
+    src/screens/alpha_arena/EquityCurveWidget.cpp
+    src/screens/alpha_arena/LeaderboardCards.cpp
+    src/screens/alpha_arena/ArenaTabs.cpp
+    src/screens/alpha_arena/NewCompetitionWizard.cpp
     src/screens/alpha_arena/panels/LiveModeGateDialog.cpp
 
     # Alternative Investments — partial-class split; see header.
@@ -1780,7 +1907,6 @@ set(SCREEN_SOURCES
     src/screens/equity_research/EquityValuationTab.h
     src/screens/equity_research/EquityValuationTab.cpp
     src/screens/equity_research/EquityTechnicalsTab.cpp
-    src/screens/equity_research/EquityTalippTab.cpp
     src/screens/equity_research/EquityPeersTab.cpp
     src/screens/equity_research/EquityNewsTab.cpp
     src/screens/equity_research/EquitySentimentTab.cpp
@@ -1871,6 +1997,7 @@ set(SCREEN_SOURCES
 set(APP_SOURCES
     src/app/main.cpp
     src/app/InstanceLock.cpp
+    src/app/ScreenSmokeTest.cpp
     # WindowFrame is split across multiple files; see WindowFrame.cpp header
     # comment for the layout. All variants stay outside unity build (see
     # SKIP_UNITY_BUILD_INCLUSION block below).
@@ -1939,14 +2066,16 @@ set_source_files_properties(
     src/screens/algo_trading/AlgoTradingScreen.cpp
     src/screens/algo_trading/DeploymentDashboard.cpp
     src/screens/algo_trading/ScannerPanel.cpp
+    src/screens/algo_trading/UniverseScannerPanel.cpp
     src/screens/algo_trading/AlertsPanel.cpp
     src/screens/algo_trading/StrategyBuilderPanel.cpp
     src/screens/algo_trading/StrategyListPanel.cpp
     src/screens/algo_trading/AlgoDeployDialog.cpp
     src/screens/alpha_arena/AlphaArenaScreen.cpp
-    src/screens/alpha_arena/panels/LeaderboardPanel.cpp
-    src/screens/alpha_arena/panels/ModelChatPanel.cpp
-    src/screens/alpha_arena/panels/StatePanels.cpp
+    src/screens/alpha_arena/EquityCurveWidget.cpp
+    src/screens/alpha_arena/LeaderboardCards.cpp
+    src/screens/alpha_arena/ArenaTabs.cpp
+    src/screens/alpha_arena/NewCompetitionWizard.cpp
     src/screens/alpha_arena/panels/LiveModeGateDialog.cpp
     src/screens/alt_investments/AltInvestmentsScreen.cpp
     src/screens/alt_investments/AltInvestmentsScreen_Layout.cpp
@@ -1993,9 +2122,13 @@ set_source_files_properties(
     src/screens/equity_trading/EquityOrderEntry.cpp
     src/screens/equity_trading/EquityOrderBook.cpp
     src/screens/equity_trading/EquityBottomPanel.cpp
+    src/screens/common/PaperBlotterPanel.cpp
     src/screens/equity_trading/AccountManagementDialog.cpp
     src/screens/equity_trading/BroadcastOrderDialog.cpp
+    src/screens/equity_trading/BasketOrdersDialog.cpp
     src/screens/equity_trading/OrderConfirmDialog.cpp
+    src/screens/equity_trading/PortfolioReplicationDialog.cpp
+    src/screens/portfolio_monitor/PortfolioMonitorScreen.cpp
     # Feed monitor (reusable across screens)
     src/screens/common/feeds/FeedCardView.cpp
     src/screens/common/feeds/FeedTableView.cpp
@@ -2136,7 +2269,6 @@ set_source_files_properties(
     src/screens/equity_research/EquityPeersTab.cpp
     src/screens/equity_research/EquityResearchScreen.cpp
     src/screens/equity_research/EquitySentimentTab.cpp
-    src/screens/equity_research/EquityTalippTab.cpp
     src/screens/equity_research/EquityTechnicalsTab.cpp
     src/screens/excel/ExcelScreen.cpp
     src/screens/excel/SpreadsheetWidget.cpp
@@ -2350,6 +2482,11 @@ set_source_files_properties(
     src/storage/sqlite/migrations/v042_scan_watch_events.cpp
     src/storage/sqlite/migrations/v043_feed_subscriptions.cpp
     src/storage/sqlite/migrations/v044_feed_items.cpp
+    src/storage/sqlite/migrations/v045_scan_watch_universe.cpp
+    src/storage/sqlite/migrations/v046_fno_algo.cpp
+    src/storage/sqlite/migrations/v047_algo_multileg_trades.cpp
+    src/storage/sqlite/migrations/v048_instruments_exchange_unique.cpp
+    src/storage/sqlite/migrations/v050_alpha_arena_rewrite.cpp
     # Polymarket screen files — each defines static fmt_* helpers in same namespace
     src/screens/polymarket/PolymarketScreen.cpp
     src/screens/polymarket/PolymarketCommandBar.cpp
@@ -2422,18 +2559,18 @@ set_source_files_properties(
 # and Q_OBJECT-bearing helpers — exclude from unity to avoid the kind of
 # ODR clashes that masked compile errors in early Phase 5c integration.
 set_source_files_properties(
-    src/services/alpha_arena/AlphaArenaJson.cpp
-    src/services/alpha_arena/Indicators.cpp
-    src/services/alpha_arena/ContextBuilder.cpp
-    src/services/alpha_arena/AlphaArenaRepo.cpp
-    src/services/alpha_arena/RiskEngine.cpp
-    src/services/alpha_arena/PaperVenue.cpp
-    src/services/alpha_arena/SecretRedemptionServer.cpp
-    src/services/alpha_arena/TickClock.cpp
-    src/services/alpha_arena/ModelDispatcher.cpp
-    src/services/alpha_arena/OrderRouter.cpp
-    src/services/alpha_arena/AlphaArenaEngine.cpp
-    src/services/alpha_arena/AlphaArenaService.cpp
+    src/services/alpha_arena/ArenaStore.cpp
+    src/services/alpha_arena/ArenaIndicators.cpp
+    src/services/alpha_arena/ArenaDecisionParser.cpp
+    src/services/alpha_arena/PaperExchange.cpp
+    src/services/alpha_arena/ArenaRisk.cpp
+    src/services/alpha_arena/ArenaModelRegistry.cpp
+    src/services/alpha_arena/ArenaPrompts.cpp
+    src/services/alpha_arena/ArenaLlmClient.cpp
+    src/services/alpha_arena/ArenaMarketData.cpp
+    src/services/alpha_arena/ArenaEngine.cpp
+    src/services/alpha_arena/HyperliquidLiveVenue.cpp
+    src/services/alpha_arena/ArenaSelftest.cpp
     src/trading/exchanges/hyperliquid/HyperliquidClient.cpp
     src/trading/exchanges/hyperliquid/Keccak256.cpp
     src/trading/exchanges/hyperliquid/HyperliquidSigner.cpp
@@ -2495,6 +2632,15 @@ set_source_files_properties(
     src/mcp/tools/GeopoliticsTools.cpp
     src/mcp/tools/ExcelTools.cpp
     src/mcp/tools/SurfaceAnalyticsTools.cpp
+    src/algo_engine/fno/FnoAlgoSelftest.cpp
+    src/algo_engine/fno/FnoLegResolver.cpp
+    src/trading/PaperTradingSelftest.cpp
+    src/trading/PaperMarkService.cpp
+    # Portfolio Monitor: file-local helpers (signed_qty/approx) would collide with
+    # sibling files' anonymous-namespace helpers inside a unity blob. (The screen
+    # cpp is excluded via the screens block above.)
+    src/trading/UnifiedPortfolioService.cpp
+    src/trading/PortfolioMonitorSelftest.cpp
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE
 )
 
@@ -3110,19 +3256,44 @@ if(WIN32)
         get_filename_component(_fincept_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
         list(APPEND _fincept_qt_bin_hints "${_fincept_qt_prefix}/bin")
     endif()
+    # Dev redeploy trigger: wipe the windeployqt stamp on every configure so the
+    # next build re-runs windeployqt exactly once (see the dev/release split below).
+    if(FINCEPT_DEV_BUILD)
+        file(REMOVE "${CMAKE_BINARY_DIR}/windeployqt_dev.stamp")
+    endif()
     find_program(WINDEPLOYQT_EXE windeployqt HINTS ${_fincept_qt_bin_hints})
     unset(_fincept_qt_bin_hints)
     if(WINDEPLOYQT_EXE)
-        # Always deploy Qt DLLs/plugins next to the exe. windeployqt is
-        # idempotent and copy_if_different — incremental cost is ~1-2 s
-        # when nothing changed. The previous DEPLOY_QT=ON gate caused the
-        # exe to run against a stale plugin set after a clean rebuild,
-        # producing 0xc0000005 crashes on startup.
-        add_custom_command(TARGET FinceptTerminal POST_BUILD
-            COMMAND "${WINDEPLOYQT_EXE}"
-            ARGS "--no-translations" "--no-compiler-runtime" "$<TARGET_FILE:FinceptTerminal>"
-            COMMENT "Running windeployqt..."
-        )
+        # Deploy Qt DLLs/plugins next to the exe. windeployqt re-walks the WHOLE Qt
+        # dependency tree (every QtQuick/Controls QML + plugin + WebEngine .pak) on
+        # EVERY run — measured ~30 s on this project even when it copies nothing
+        # ("X is up to date" x1400). On every incremental relink that tax dominates
+        # the build, so we split by build type:
+        #   • Release → always run. Guarantees a correct, fresh plugin set; the old
+        #     DEPLOY_QT gate once shipped a stale set → 0xc0000005 crashes on launch.
+        #   • Dev     → run ONCE per configure via a stamp, then skip. The stamp is
+        #     deleted at configure time (above), so any CMake re-run — including the
+        #     auto-reconfigure CMake performs when you edit CMakeLists to add a Qt
+        #     module — forces one fresh redeploy. Plain .cpp edits skip windeployqt,
+        #     turning a ~35 s build into ~5 s. Force a redeploy by deleting
+        #     build/<preset>/windeployqt_dev.stamp or reconfiguring.
+        if(FINCEPT_DEV_BUILD)
+            add_custom_command(TARGET FinceptTerminal POST_BUILD
+                COMMAND "${CMAKE_COMMAND}"
+                    -D "WDQT=${WINDEPLOYQT_EXE}"
+                    -D "EXE=$<TARGET_FILE:FinceptTerminal>"
+                    -D "STAMP=${CMAKE_BINARY_DIR}/windeployqt_dev.stamp"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_qt_once.cmake"
+                COMMENT "windeployqt (dev: once per configure, then skipped)..."
+                VERBATIM
+            )
+        else()
+            add_custom_command(TARGET FinceptTerminal POST_BUILD
+                COMMAND "${WINDEPLOYQT_EXE}"
+                ARGS "--no-translations" "--no-compiler-runtime" "$<TARGET_FILE:FinceptTerminal>"
+                COMMENT "Running windeployqt..."
+            )
+        endif()
     endif()
 
     # ── Optional: override sqldrivers from a known-consistent Qt install ──────
@@ -3219,19 +3390,77 @@ add_custom_command(TARGET FinceptTerminal POST_BUILD
 )
 
 # Bundle yt-dlp for dashboard YouTube playback on all platforms.
-# Override path with: -DFINCEPT_YTDLP_EXE=/abs/path/to/yt-dlp[.exe]
-set(FINCEPT_YTDLP_EXE "" CACHE FILEPATH "Path to yt-dlp executable to bundle with FinceptTerminal")
-# Default OFF so builds on CI / macOS / Linux succeed without yt-dlp pre-installed.
-# Set ON only for official release builds where yt-dlp must be present.
-option(FINCEPT_REQUIRE_BUNDLED_YTDLP "Fail configure if yt-dlp is missing" OFF)
+#
+# Sourcing strategy (in priority order):
+#   1. -DFINCEPT_YTDLP_EXE=/abs/path/to/yt-dlp[.exe]  — explicit override (air-gapped builds)
+#   2. Auto-download the pinned release from GitHub at configure time, verified by SHA-256.
+#
+# The download is the default so a clean checkout on any platform self-provisions
+# yt-dlp with zero machine setup. The pinned version + hashes make it reproducible
+# and tamper-evident. Bump FINCEPT_YTDLP_VERSION + the three hashes together when
+# upgrading (hashes come from the release's SHA2-256SUMS file).
+set(FINCEPT_YTDLP_EXE "" CACHE FILEPATH "Path to yt-dlp executable to bundle (overrides auto-download)")
+set(FINCEPT_YTDLP_VERSION "2026.03.17" CACHE STRING "Pinned yt-dlp release tag to download")
+option(FINCEPT_DOWNLOAD_YTDLP "Auto-download yt-dlp at configure time if no override is set" ON)
+# Default OFF so a transient network failure doesn't hard-block local dev builds.
+# Set ON for official release builds so a missing yt-dlp fails the build loudly.
+option(FINCEPT_REQUIRE_BUNDLED_YTDLP "Fail configure if yt-dlp can't be provisioned" OFF)
+
+# Per-platform release asset name + SHA-256 for the pinned version. Update all
+# three hashes whenever FINCEPT_YTDLP_VERSION changes.
+if(WIN32)
+    set(FINCEPT_YTDLP_ASSET  "yt-dlp.exe")
+    set(FINCEPT_YTDLP_SHA256 "3db811b366b2da47337d2fcfdfe5bbd9a258dad3f350c54974f005df115a1545")
+elseif(APPLE)
+    set(FINCEPT_YTDLP_ASSET  "yt-dlp_macos")
+    set(FINCEPT_YTDLP_SHA256 "e80c47b3ce712acee51d5e3d4eace2d181b44d38f1942c3a32e3c7ff53cd9ed5")
+else()
+    set(FINCEPT_YTDLP_ASSET  "yt-dlp_linux")
+    set(FINCEPT_YTDLP_SHA256 "c2b0189f581fe4a2ddd41954f1bcb7d327db04b07ed0dea97e4f1b3e09b5dd8e")
+endif()
 
 set(FINCEPT_YTDLP_TO_BUNDLE "")
-if(FINCEPT_YTDLP_EXE)
+if(FINCEPT_YTDLP_EXE AND EXISTS "${FINCEPT_YTDLP_EXE}")
+    # 1. Explicit override.
     set(FINCEPT_YTDLP_TO_BUNDLE "${FINCEPT_YTDLP_EXE}")
-else()
-    find_program(FINCEPT_YTDLP_AUTO_EXE NAMES yt-dlp yt-dlp.exe)
-    if(FINCEPT_YTDLP_AUTO_EXE)
-        set(FINCEPT_YTDLP_TO_BUNDLE "${FINCEPT_YTDLP_AUTO_EXE}")
+    message(STATUS "yt-dlp: using override ${FINCEPT_YTDLP_EXE}")
+elseif(FINCEPT_DOWNLOAD_YTDLP)
+    # 2. Auto-download the pinned, hash-verified release into the build tree.
+    set(FINCEPT_YTDLP_DL_DIR  "${CMAKE_BINARY_DIR}/yt-dlp")
+    set(FINCEPT_YTDLP_DL_FILE "${FINCEPT_YTDLP_DL_DIR}/${FINCEPT_YTDLP_ASSET}")
+    set(FINCEPT_YTDLP_URL
+        "https://github.com/yt-dlp/yt-dlp/releases/download/${FINCEPT_YTDLP_VERSION}/${FINCEPT_YTDLP_ASSET}")
+
+    # Re-verify any existing download; a hash mismatch (partial/corrupt/tampered)
+    # forces a fresh fetch.
+    set(_ytdlp_need_download TRUE)
+    if(EXISTS "${FINCEPT_YTDLP_DL_FILE}")
+        file(SHA256 "${FINCEPT_YTDLP_DL_FILE}" _ytdlp_existing_hash)
+        if(_ytdlp_existing_hash STREQUAL "${FINCEPT_YTDLP_SHA256}")
+            set(_ytdlp_need_download FALSE)
+        endif()
+    endif()
+
+    if(_ytdlp_need_download)
+        message(STATUS "yt-dlp: downloading ${FINCEPT_YTDLP_VERSION} (${FINCEPT_YTDLP_ASSET})...")
+        file(DOWNLOAD
+            "${FINCEPT_YTDLP_URL}"
+            "${FINCEPT_YTDLP_DL_FILE}"
+            EXPECTED_HASH "SHA256=${FINCEPT_YTDLP_SHA256}"
+            SHOW_PROGRESS
+            STATUS _ytdlp_dl_status
+            TLS_VERIFY ON)
+        list(GET _ytdlp_dl_status 0 _ytdlp_dl_code)
+        if(NOT _ytdlp_dl_code EQUAL 0)
+            list(GET _ytdlp_dl_status 1 _ytdlp_dl_msg)
+            # Drop the partial file so a retry doesn't see a bad cache.
+            file(REMOVE "${FINCEPT_YTDLP_DL_FILE}")
+            message(WARNING "yt-dlp download failed (${_ytdlp_dl_msg}). Video playback will be unavailable.")
+        endif()
+    endif()
+
+    if(EXISTS "${FINCEPT_YTDLP_DL_FILE}")
+        set(FINCEPT_YTDLP_TO_BUNDLE "${FINCEPT_YTDLP_DL_FILE}")
     endif()
 endif()
 
@@ -3257,7 +3486,9 @@ if(FINCEPT_YTDLP_TO_BUNDLE AND EXISTS "${FINCEPT_YTDLP_TO_BUNDLE}")
     endif()
 else()
     set(FINCEPT_YTDLP_MISSING_MSG
-        "yt-dlp not found. Set FINCEPT_YTDLP_EXE or install yt-dlp on build machine. "
+        "yt-dlp could not be provisioned. Auto-download is "
+        "${FINCEPT_DOWNLOAD_YTDLP} for version ${FINCEPT_YTDLP_VERSION}; set "
+        "-DFINCEPT_YTDLP_EXE=/path/to/yt-dlp to supply it manually (e.g. air-gapped builds). "
         "Bundling is required so end users need no setup."
     )
     if(FINCEPT_REQUIRE_BUNDLED_YTDLP)
@@ -3289,18 +3520,71 @@ if(WIN32)
             DESTINATION "resources/notebooks" COMPONENT core)
 
 elseif(APPLE)
-    # macOS: install the .app bundle
-    install(TARGETS FinceptTerminal BUNDLE DESTINATION "." COMPONENT core)
-    # Requirements files — deployed beside the .app so PythonSetupManager finds them
-    install(FILES
-            "${CMAKE_CURRENT_SOURCE_DIR}/resources/requirements-numpy1.txt"
-            "${CMAKE_CURRENT_SOURCE_DIR}/resources/requirements-numpy2.txt"
-            DESTINATION "FinceptTerminal.app/Contents/Resources/resources" COMPONENT core)
-    # Prebuilt Fincept Notebook library (bundled + seeded into the File Manager).
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/resources/notebooks/"
-            DESTINATION "FinceptTerminal.app/Contents/Resources/resources/notebooks" COMPONENT core)
+    if(FINCEPT_BUILD_INSTALLER)
+        # ── macOS IFW installer path ─────────────────────────────────────────
+        # Package the bundle that CI has ALREADY run macdeployqt + deep codesign
+        # over (build/FinceptTerminal.app, signed in place). Copy it with
+        # `ditto`, which preserves framework symlinks AND code signatures —
+        # plain install(TARGETS)/file(INSTALL) rewrites them and triggers the
+        # dyld "Code Signature Invalid" SIGKILL from issue #139. The signed
+        # bundle already contains scripts/, resources/, requirements, and
+        # notebooks (staged before signing), so we copy it whole and inject
+        # NOTHING afterwards (any post-sign edit breaks the seal).
+        # CONTRACT: CI must macdeployqt + codesign the bundle BEFORE `cpack -G IFW`.
+        install(CODE "
+            message(STATUS \"[Fincept] Packaging signed .app via ditto for IFW installer\")
+            execute_process(
+                COMMAND /usr/bin/ditto
+                    \"$<TARGET_BUNDLE_DIR:FinceptTerminal>\"
+                    \"\${CMAKE_INSTALL_PREFIX}/FinceptTerminal.app\"
+                RESULT_VARIABLE _fincept_ditto_rc)
+            if(NOT _fincept_ditto_rc EQUAL 0)
+                message(FATAL_ERROR \"[Fincept] ditto of signed .app failed (rc=\${_fincept_ditto_rc})\")
+            endif()
+        " COMPONENT core)
+    else()
+        # ── Plain `cmake --install` (DMG path / dev) ─────────────────────────
+        # macOS: install the .app bundle
+        install(TARGETS FinceptTerminal BUNDLE DESTINATION "." COMPONENT core)
+        # Requirements files — deployed beside the .app so PythonSetupManager finds them
+        install(FILES
+                "${CMAKE_CURRENT_SOURCE_DIR}/resources/requirements-numpy1.txt"
+                "${CMAKE_CURRENT_SOURCE_DIR}/resources/requirements-numpy2.txt"
+                DESTINATION "FinceptTerminal.app/Contents/Resources/resources" COMPONENT core)
+        # Prebuilt Fincept Notebook library (bundled + seeded into the File Manager).
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/resources/notebooks/"
+                DESTINATION "FinceptTerminal.app/Contents/Resources/resources/notebooks" COMPONENT core)
+    endif()
+
+elseif(FINCEPT_BUILD_INSTALLER AND FINCEPT_IFW_PAYLOAD)
+    # ── Linux IFW installer path (relocatable, self-contained) ───────────────
+    # Ship the tree that linuxdeploy already produced (app binary + bundled Qt
+    # libs + plugins), so the installed app runs from ANY chosen TargetDir.
+    # The binary's rpath ($ORIGIN/../lib, set by linuxdeploy) plus the staged
+    # qt.conf resolve Qt's libraries and plugins relative to the install dir —
+    # no system Qt, no LD_LIBRARY_PATH, no fixed prefix. IFW does not bundle
+    # dependencies itself, so CI sets FINCEPT_IFW_PAYLOAD to the linuxdeploy
+    # AppDir's usr/ directory.
+    install(DIRECTORY "${FINCEPT_IFW_PAYLOAD}/"
+            DESTINATION "."
+            USE_SOURCE_PERMISSIONS
+            COMPONENT core)
+    # qt.conf next to the binary so Qt finds the bundled plugins/libs at any
+    # install location (an IFW install has no AppRun launcher to set env vars).
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/qt.conf"
+            DESTINATION "bin" COMPONENT core)
+    # NOTE: scripts/, resources/, and requirements live INSIDE the linuxdeploy
+    # AppDir payload already (staged into usr/bin/ by the CI AppImage step), so
+    # they are captured by the install(DIRECTORY) above — no separate scripts
+    # component here (it is Windows-only; see the IFW component config below).
 
 else()
+    if(FINCEPT_BUILD_INSTALLER AND NOT FINCEPT_IFW_PAYLOAD)
+        message(WARNING
+            "FINCEPT_BUILD_INSTALLER is ON for Linux but FINCEPT_IFW_PAYLOAD is unset — "
+            "the IFW .run would ship WITHOUT bundled Qt and fail to launch. "
+            "Set -DFINCEPT_IFW_PAYLOAD=<linuxdeploy-AppDir>/usr, or build the AppImage instead.")
+    endif()
     # Linux: FHS-compliant layout. Architecture-neutral — works for x86_64
     # and aarch64 (ARM64) without changes; CMake just installs the binary
     # produced for the target arch into share/fincept-terminal/. To build for
@@ -3379,6 +3663,16 @@ endif()
 
 option(FINCEPT_BUILD_INSTALLER "Generate QtIFW installer via CPack" OFF)
 
+# Path to a pre-deployed, self-contained payload that the IFW installer should
+# package on macOS/Linux. QtIFW does NOT bundle dependencies itself — the OS
+# deploy tools must run first (windeployqt on Windows, macdeployqt on macOS,
+# linuxdeploy on Linux). On Linux, set this to the linuxdeploy AppDir's usr/
+# directory so the .run ships bundled Qt and is relocatable. Unused on Windows
+# (windeployqt output is captured directly below) and on macOS (the signed
+# .app is copied via ditto in the install rule above).
+set(FINCEPT_IFW_PAYLOAD "" CACHE PATH
+    "Pre-deployed payload dir for the IFW installer (Linux: linuxdeploy AppDir/usr)")
+
 if(FINCEPT_BUILD_INSTALLER)
 
     # ── Windows: capture windeployqt output for the installer ────────────────
@@ -3388,6 +3682,32 @@ if(FINCEPT_BUILD_INSTALLER)
                 COMPONENT core
                 FILES_MATCHING
                 PATTERN "*.dll")
+        # Qt WebEngine runtime helper + data files. windeployqt / the CI stage
+        # step place these next to the exe in the build dir, but the *.dll
+        # pattern above silently drops them: QtWebEngineProcess.exe is an .exe,
+        # and the Chromium data lives in resources/*.pak + resources/icudtl.dat
+        # and translations/qtwebengine_locales/*.pak. If they're absent from the
+        # installed tree, constructing a QWebEngineView aborts the whole process
+        # (the v4.1.0 Equity-tab crash). These install() calls are OPTIONAL so a
+        # build without WebEngine (HAS_WEBENGINE=FALSE → no helper staged) still
+        # packages cleanly; the runtime probe in KLineChartWidget degrades to the
+        # Qt-Charts fallback in that case.
+        install(FILES "$<TARGET_FILE_DIR:FinceptTerminal>/QtWebEngineProcess.exe"
+                DESTINATION "." COMPONENT core OPTIONAL)
+        # Chromium resource paks + ICU data. The source resources/ tree is
+        # installed separately below (app assets); these are *additional* files
+        # the CI stage step dropped into the build dir's resources/ folder, so
+        # capture them by name from the staged dir rather than re-globbing.
+        install(FILES
+                "$<TARGET_FILE_DIR:FinceptTerminal>/resources/icudtl.dat"
+                "$<TARGET_FILE_DIR:FinceptTerminal>/resources/qtwebengine_resources.pak"
+                "$<TARGET_FILE_DIR:FinceptTerminal>/resources/qtwebengine_resources_100p.pak"
+                "$<TARGET_FILE_DIR:FinceptTerminal>/resources/qtwebengine_resources_200p.pak"
+                "$<TARGET_FILE_DIR:FinceptTerminal>/resources/qtwebengine_devtools_resources.pak"
+                DESTINATION "resources" COMPONENT core OPTIONAL)
+        # WebEngine locale paks (not covered by windeployqt --no-translations).
+        install(DIRECTORY "$<TARGET_FILE_DIR:FinceptTerminal>/translations/qtwebengine_locales"
+                DESTINATION "translations" COMPONENT core OPTIONAL)
         # Python analytics scripts (4000+ files) — required at runtime by
         # PythonRunner / ExchangeService. Without this the Crypto tab and all
         # Python-backed screens crash on an installed build.
@@ -3520,13 +3840,20 @@ if(FINCEPT_BUILD_INSTALLER)
     set(CPACK_IFW_PACKAGE_CONTROL_SCRIPT
         "${CMAKE_CURRENT_SOURCE_DIR}/packaging/installer/config/controlscript.qs")
 
-    # Target directory defaults per platform
+    # Target directory defaults per platform. These are only DEFAULTS — the
+    # wizard's Target Directory page lets the user pick any path (the page is
+    # shown interactively now that controlscript.qs guards its auto-advance
+    # with isCommandLineInstance()).
     if(WIN32)
         set(CPACK_IFW_TARGET_DIRECTORY "@ApplicationsDirX64@/FinceptTerminal")
     elseif(APPLE)
         set(CPACK_IFW_TARGET_DIRECTORY "/Applications/FinceptTerminal")
     else()
+        # Default to the user's home so no root is required; the installer only
+        # escalates (and uses AdminTargetDir) if the chosen path isn't writable.
+        # The app is relocatable, so any custom path works either way.
         set(CPACK_IFW_TARGET_DIRECTORY "@HomeDir@/FinceptTerminal")
+        set(CPACK_IFW_ADMIN_TARGET_DIRECTORY "/opt/FinceptTerminal")
     endif()
 
     # Output file naming — arch-aware so the auto-updater manifest can point
@@ -3584,10 +3911,15 @@ if(FINCEPT_BUILD_INSTALLER)
         DESCRIPTION  "Core application executable and Qt runtime libraries"
         REQUIRED)
 
-    cpack_add_component(scripts
-        DISPLAY_NAME "Python Analytics Scripts"
-        DESCRIPTION  "1300+ Python analytics scripts (equity, derivatives, portfolio, quant)"
-        DEPENDS core)
+    # Scripts are a separate, optional component on Windows only. On macOS they
+    # ship inside the signed .app bundle, and on Linux inside the linuxdeploy
+    # AppDir payload — both captured by the `core` component on those platforms.
+    if(WIN32)
+        cpack_add_component(scripts
+            DISPLAY_NAME "Python Analytics Scripts"
+            DESCRIPTION  "1300+ Python analytics scripts (equity, derivatives, portfolio, quant)"
+            DEPENDS core)
+    endif()
 
     # ── CPackIFW component configuration ─────────────────────────────────────
     cpack_ifw_configure_component(core
@@ -3599,12 +3931,14 @@ if(FINCEPT_BUILD_INSTALLER)
         DEFAULT TRUE
         FORCED_INSTALLATION)
 
-    cpack_ifw_configure_component(scripts
-        NAME "com.fincept.terminal.scripts"
-        VERSION "${CMAKE_PROJECT_VERSION}"
-        SORTING_PRIORITY 50
-        DEFAULT TRUE
-        DEPENDS "com.fincept.terminal.core")
+    if(WIN32)
+        cpack_ifw_configure_component(scripts
+            NAME "com.fincept.terminal.scripts"
+            VERSION "${CMAKE_PROJECT_VERSION}"
+            SORTING_PRIORITY 50
+            DEFAULT TRUE
+            DEPENDS "com.fincept.terminal.core")
+    endif()
 
     # ── Linux: AppImage helper target ────────────────────────────────────────
     # `linuxdeploy` + `linuxdeploy-plugin-qt` are external tools; we don't

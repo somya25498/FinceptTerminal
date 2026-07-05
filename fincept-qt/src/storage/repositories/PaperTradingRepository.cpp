@@ -1,5 +1,7 @@
 #include "storage/repositories/PaperTradingRepository.h"
 
+#include <cmath>
+
 namespace fincept {
 
 using namespace trading;
@@ -266,12 +268,32 @@ std::optional<PtPosition> PaperTradingRepository::find_position(const QString& p
 }
 
 Result<void> PaperTradingRepository::update_position(const QString& id, double quantity, double entry_price) {
-    return exec_write("UPDATE pt_positions SET quantity = ?, entry_price = ? WHERE id = ?",
-                      {quantity, entry_price, id});
+    // Recompute unrealized_pnl in the same write. Previously this updated only
+    // quantity/entry_price, leaving unrealized_pnl stale after an averaging fill
+    // or a partial close until the next price tick — so a freshly averaged/reduced
+    // position showed P&L against the OLD entry/qty. Recompute against the last
+    // good current_price (guarded: a 0/unset mark keeps the existing value so we
+    // never surface a phantom full-notional P&L).
+    return exec_write(
+        "UPDATE pt_positions SET quantity = ?, entry_price = ?, "
+        "unrealized_pnl = CASE WHEN current_price > 0 THEN "
+        "(CASE WHEN side = 'long' THEN (current_price - ?) * ? ELSE (? - current_price) * ? END) "
+        "ELSE unrealized_pnl END "
+        "WHERE id = ?",
+        {quantity, entry_price, entry_price, quantity, entry_price, quantity, id});
 }
 
 Result<void> PaperTradingRepository::update_position_price(const QString& portfolio_id, const QString& symbol,
                                                            double price) {
+    // Guard against garbage/zero ticks. A non-finite or non-positive mark price
+    // is never a real trade — feeds occasionally emit 0.0 for an illiquid leg or
+    // a malformed packet. Writing it through recomputes unrealized_pnl as
+    // (entry - 0) * qty, which on a SHORT option surfaces the FULL premium as a
+    // phantom profit (the "square-off shows total trade value in profit" bug).
+    // Ignore it so the position keeps its last good price + P&L.
+    if (!std::isfinite(price) || price <= 0.0)
+        return Result<void>::ok();
+
     // Update current_price AND recompute unrealized_pnl atomically
     // long: (price - entry) * qty,  short: (entry - price) * qty
     return exec_write("UPDATE pt_positions SET current_price = ?, "

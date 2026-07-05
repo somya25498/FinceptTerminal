@@ -8,6 +8,7 @@
 
 #include "screens/settings/LlmConfigSection.h"
 
+#include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "services/llm/LlmService.h"
 #include "storage/repositories/LlmConfigRepository.h"
@@ -15,6 +16,8 @@
 #include "storage/repositories/SettingsRepository.h"
 #include "ui/theme/Theme.h"
 #include "ui/theme/ThemeManager.h"
+
+#include <QHash>
 
 // Unity-build hygiene: this split TU shares an unstable unity bucket with
 // LlmConfigSection.cpp (static TAG) and LlmConfigSection_Profiles.cpp
@@ -96,12 +99,20 @@ QWidget* LlmConfigSection::build_provider_list_panel() {
                             "QPushButton:hover{background:" +
                             QString(ui::colors::BG_RAISED()) + ";}");
     connect(add_btn_, &QPushButton::clicked, this, [this]() {
-        // Show input dialog to pick provider
-        QStringList choices = KNOWN_PROVIDERS;
+        // Show input dialog to pick provider — display formatted names in
+        // alphabetical order, then map the choice back to its provider id.
+        QStringList choices;
+        QHash<QString, QString> display_to_id;
+        for (const auto& id : providers_sorted()) {
+            const QString disp = provider_display_name(id);
+            choices << disp;
+            display_to_id.insert(disp, id);
+        }
         bool ok;
-        QString provider = QInputDialog::getItem(this, tr("Add Provider"), tr("Select provider:"), choices, 0, false, &ok);
-        if (!ok || provider.isEmpty())
+        QString chosen = QInputDialog::getItem(this, tr("Add Provider"), tr("Select provider:"), choices, 0, false, &ok);
+        if (!ok || chosen.isEmpty())
             return;
+        QString provider = display_to_id.value(chosen, chosen);
 
         // Check if already exists
         auto existing = LlmConfigRepository::instance().list_providers();
@@ -459,7 +470,7 @@ void LlmConfigSection::load_providers() {
     if (result.is_ok()) {
         for (const auto& p : result.value()) {
             bool is_fincept = (p.provider.toLower() == "fincept");
-            QString display = is_fincept ? tr("Fincept LLM") : p.provider;
+            QString display = provider_display_name(p.provider);
             if (p.is_active) {
                 display += "  ✓";
                 active_provider = p.provider;
@@ -548,9 +559,9 @@ void LlmConfigSection::populate_form(const QString& provider) {
 
             if (is_fincept) {
                 api_key_edit_->clear();
-                auto stored = SettingsRepository::instance().get("fincept_api_key");
-                if (stored.is_ok() && !stored.value().isEmpty()) {
-                    QString masked = stored.value().left(8) + "...";
+                const QString stored = fincept::auth::AuthManager::instance().fincept_api_key();
+                if (!stored.isEmpty()) {
+                    QString masked = stored.left(8) + "...";
                     api_key_edit_->setPlaceholderText(tr("Linked to your Fincept account: %1").arg(masked));
                 } else {
                     api_key_edit_->setPlaceholderText(tr("Login to your Fincept account to enable"));
@@ -594,9 +605,9 @@ void LlmConfigSection::populate_form(const QString& provider) {
     api_key_edit_->clear();
     api_key_edit_->setEnabled(!is_fincept && !is_ollama);
     if (is_fincept) {
-        auto stored = SettingsRepository::instance().get("fincept_api_key");
-        if (stored.is_ok() && !stored.value().isEmpty())
-            api_key_edit_->setPlaceholderText(tr("Linked to your Fincept account: %1").arg(stored.value().left(8) + "..."));
+        const QString stored = fincept::auth::AuthManager::instance().fincept_api_key();
+        if (!stored.isEmpty())
+            api_key_edit_->setPlaceholderText(tr("Linked to your Fincept account: %1").arg(stored.left(8) + "..."));
         else
             api_key_edit_->setPlaceholderText(tr("Login to your Fincept account to enable"));
         model_combo_->setVisible(false);
@@ -758,9 +769,9 @@ void LlmConfigSection::on_test_connection() {
     }
 
     if (provider == "fincept") {
-        // Fincept is a managed service — verify API key exists
-        auto stored = SettingsRepository::instance().get("fincept_api_key");
-        if (stored.is_ok() && !stored.value().isEmpty())
+        // Fincept is a managed service — verify API key exists (session → SecureStorage)
+        const QString stored = fincept::auth::AuthManager::instance().fincept_api_key();
+        if (!stored.isEmpty())
             show_status(tr("Fincept connected — API key active"), false);
         else
             show_status(tr("Not connected — login to your Fincept account first"), true);

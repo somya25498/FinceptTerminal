@@ -1,11 +1,14 @@
 ﻿#include "algo_engine/AlgoEngineProducer.h"
 #include "algo_engine/ScanMonitor.h"
+#include "algo_engine/UniverseScanSelftest.h"
+#include "algo_engine/fno/FnoAlgoSelftest.h"
 #include "services/llm/LlmService.h"
 #include "ui/notifications/DesktopNotifier.h"
 #include "app/MonitorPickerDialog.h"
+#include "app/ScreenSmokeTest.h"
 #include "app/WindowFrame.h"
 #include "app/TerminalShell.h"
-#include "core/keys/WindowCycler.h"
+#include "core/window/WindowRegistry.h"
 #include "auth/AuthManager.h"
 #include "auth/InactivityGuard.h"
 #include "auth/PinManager.h"
@@ -18,6 +21,7 @@
 #include "core/currency/CurrencyManager.h"
 #include "core/i18n/LanguageManager.h"
 #include "core/keys/KeyConfigManager.h"
+#include "core/layout/DockLayoutSelftest.h"
 #include "core/logging/Logger.h"
 #include "core/session/ScreenStateManager.h"
 #include "core/session/SessionManager.h"
@@ -26,7 +30,11 @@
 #include "datahub/DataHubMetaTypes.h"
 #include "mcp/McpInit.h"
 #include "mcp/ToolSelfTest.h"
+#include "services/alpha_arena/ArenaSelftest.h"
 #include "services/feeds/FeedSelfTest.h"
+#include "trading/PaperTradingSelftest.h"
+#include "trading/UnifiedPortfolioService.h"
+#include "trading/replication/PortfolioReplicationSelftest.h"
 #include "network/http/HttpClient.h"
 #include "python/PythonSetupManager.h"
 #include "screens/launchpad/LaunchpadScreen.h"
@@ -47,7 +55,7 @@
 #include "services/options/FiiDiiService.h"
 #include "services/options/OISnapshotter.h"
 #include "services/options/OptionChainService.h"
-#include "services/alpha_arena/AlphaArenaEngine.h"
+#include "services/alpha_arena/ArenaEngine.h"
 #include "services/news/NewsService.h"
 #include "services/notebooks/NotebookLibraryService.h"
 #include "services/polymarket/PolymarketWebSocket.h"
@@ -72,6 +80,7 @@
 #include "trading/AccountManager.h"
 #include "trading/DataStreamManager.h"
 #include "trading/ExchangeService.h"
+#include "trading/PaperMarkService.h"
 #include "trading/ExchangeSessionManager.h"
 #include "storage/HistoricalDataStore.h"
 #include "storage/repositories/NewsArticleRepository.h"
@@ -108,6 +117,7 @@
 #include <QUuid>
 
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 
 #include "app/InstanceLock.h"
@@ -118,21 +128,40 @@
 
 // Wire the two app-level lifecycle handlers that fire after the primary
 // window exists: InstanceLock::message_received (a re-launch of the exe
-// asks us to open another WindowFrame — args ignored, the request itself is
-// the trigger) and QApplication::lastWindowClosed (surface the Launchpad
+// asks us to bring the running instance to the front — args ignored, the
+// request itself is the trigger) and QApplication::lastWindowClosed (surface the Launchpad
 // instead of quitting; the Launchpad's own close handler quits explicitly).
 // Called from both the post-setup-screen path and the no-setup path so the
 // two branches stay in sync.
 static void wire_app_lifecycle(QApplication& app, fincept::InstanceLock& lock) {
     QObject::connect(&lock, &fincept::InstanceLock::message_received,
                      [](const QStringList& /*args*/) {
-                         // Route through the same picker the toolbar uses so
-                         // secondary-instance launches respect the user's
-                         // monitor choice on multi-monitor setups. Picker
-                         // short-circuits on single-monitor systems, so this
-                         // is a no-op cost there.
-                         fincept::WindowCycler::instance().new_window_on_next_monitor();
-                         LOG_INFO("App", "New window opened via secondary instance request");
+                         // Re-launching the exe while an instance is already
+                         // running means "bring the running instance forward" —
+                         // the standard single-instance behaviour — NOT "open a
+                         // new window". Opening a new window (and the monitor
+                         // picker that goes with it) stays an EXPLICIT action:
+                         // the toolbar "New Window", Ctrl+Shift+N, the Launchpad
+                         // button, and tear-off. Routing relaunches through the
+                         // picker surprised users by prompting for a monitor on
+                         // every open even when they never asked for a new window.
+                         const auto frames = fincept::WindowRegistry::instance().frames();
+                         if (!frames.isEmpty()) {
+                             // Lowest window_id (the primary) is the predictable
+                             // target. Activating one window pulls the whole app
+                             // forward on every platform we support.
+                             fincept::WindowFrame* target = frames.first();
+                             if (target->isMinimized())
+                                 target->showNormal();
+                             target->raise();
+                             target->activateWindow();
+                             LOG_INFO("App", "Secondary instance request — raised existing window");
+                         } else {
+                             // No live frames (e.g. the user closed to the
+                             // Launchpad). Surface it instead of silently no-op'ing.
+                             fincept::screens::LaunchpadScreen::instance()->surface();
+                             LOG_INFO("App", "Secondary instance request — surfaced Launchpad");
+                         }
                      });
     QObject::connect(&app, &QApplication::lastWindowClosed, &app, []() {
         // Settings → General → "On last window close" controls behaviour.
@@ -398,10 +427,10 @@ int main(int argc, char* argv[]) {
         fincept::trading::ExchangeSessionManager::instance().ensure_registered_with_hub();
         // Prediction Markets — `prediction:polymarket:*`.
         fincept::services::polymarket::PolymarketWebSocket::instance().ensure_registered_with_hub();
-        // Alpha Arena engine — TickClock, ModelDispatcher, OrderRouter,
-        // PaperVenue. Not a DataHub Producer (callback-style by design).
-        // init() is idempotent; pre-resolves crash-recovery state.
-        fincept::services::alpha_arena::AlphaArenaEngine::instance().init();
+        // Alpha Arena engine — init() is idempotent and only scans for
+        // crashed competitions (no-op with none). Not a DataHub Producer
+        // (callback-style by design).
+        fincept::arena::ArenaEngine::instance().init();
         {
             auto& reg = fincept::services::prediction::PredictionExchangeRegistry::instance();
             reg.register_adapter(
@@ -657,7 +686,7 @@ int main(int argc, char* argv[]) {
                 log.set_tag_level(tag, lvl_map.value(level));
         }
     }
-    LOG_INFO("App", "Fincept Terminal v4.0.3 starting...");
+    LOG_INFO("App", "Fincept Terminal v4.1.0 starting...");
     LOG_INFO("App", QString("TLS backend: %1 (available: %2)")
                         .arg(QSslSocket::activeBackend(),
                              QSslSocket::availableBackends().join(", ")));
@@ -715,6 +744,12 @@ int main(int argc, char* argv[]) {
     fincept::register_migration_v042();
     fincept::register_migration_v043();
     fincept::register_migration_v044();
+    fincept::register_migration_v045();
+    fincept::register_migration_v046();
+    fincept::register_migration_v047();
+    fincept::register_migration_v048();
+    fincept::register_migration_v049();
+    fincept::register_migration_v050();
 
     // Open main database
     QString db_path = fincept::AppPaths::data() + "/fincept.db";
@@ -870,6 +905,20 @@ int main(int argc, char* argv[]) {
             return fincept::mcp::dump_tools_json();
         if (qstrcmp(argv[i], "--selftest-feeds") == 0)
             return fincept::feeds::run_feed_selftest();
+        if (qstrcmp(argv[i], "--selftest-dock-layout") == 0)
+            return fincept::layout::run_dock_layout_selftest();
+        if (qstrcmp(argv[i], "--selftest-fno-algo") == 0)
+            return fincept::algo::fno::run_fno_algo_selftest();
+        if (qstrcmp(argv[i], "--selftest-universe-scan") == 0)
+            return fincept::algo::run_universe_scan_selftest();
+        if (qstrcmp(argv[i], "--selftest-paper") == 0)
+            return fincept::trading::run_paper_trading_selftest();
+        if (qstrcmp(argv[i], "--selftest-portfolio-monitor") == 0)
+            return fincept::trading::run_portfolio_monitor_selftest();
+        if (qstrcmp(argv[i], "--selftest-portfolio-replication") == 0)
+            return fincept::trading::replication::run_portfolio_replication_selftest();
+        if (qstrcmp(argv[i], "--selftest-arena") == 0)
+            return fincept::arena::run_arena_selftest();
     }
 
     // Start the scan-watch background service. Runs after Database::open() (which
@@ -881,6 +930,13 @@ int main(int argc, char* argv[]) {
     // REST / native Yahoo), so it does not require the Python env to be ready.
     fincept::algo::ScanMonitor::instance().start();
 
+    // Centralized paper mark-to-market + order matching. Runs independent of which
+    // screen is open so paper positions (equity AND F&O) keep their P&L live and
+    // resting limit/stop/SL-TP orders fill continuously — not only while the
+    // Equity tab is focused. Placed alongside ScanMonitor (after the self-test
+    // early-returns, so it stays off in headless --selftest runs).
+    fincept::trading::PaperMarkService::instance().start();
+
     // Native desktop notifications (Win toast / macOS Notification Center / Linux
     // libnotify) via a tray icon — also surfaces every in-app ToastService toast.
     fincept::ui::DesktopNotifier::instance().init();
@@ -891,6 +947,21 @@ int main(int argc, char* argv[]) {
     // no window is visible yet so the brief block is acceptable. The SetupScreen
     // itself offloads prefill_completed_steps() to a background thread (P1).
     auto setup_status = fincept::python::PythonSetupManager::instance().check_status();
+
+    // --smoke-test: CI/clean-machine screen-construction walk. Force the normal
+    // boot path (we need a real WindowFrame + router to navigate every screen),
+    // and skip the Python first-run SetupScreen — the smoke test only verifies
+    // that screens CONSTRUCT on the bundled runtime, not that data fetches work.
+    // The actual walk is scheduled just after the primary window is shown.
+    bool smoke_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (qstrcmp(argv[i], "--smoke-test") == 0)
+            smoke_mode = true;
+    }
+    if (smoke_mode) {
+        LOG_INFO("Smoke", "Smoke-test mode — forcing normal boot, skipping setup/recovery");
+        setup_status.needs_setup = false;
+    }
 
     if (setup_status.needs_setup) {
         LOG_INFO("App", "Python environment not ready — showing setup screen");
@@ -930,30 +1001,15 @@ int main(int argc, char* argv[]) {
             }
 
             if (!recovered) {
+                // Single primary window by default — see the matching no-setup
+                // path below for the full rationale. Extra windows stay an
+                // explicit user action ("New Window" / Ctrl+Shift+N / tear-off).
                 const QList<int> saved_ids =
                     fincept::SessionManager::instance().load_window_ids();
-                const int max_windows = static_cast<int>(QGuiApplication::screens().size());
-
-                if (saved_ids.isEmpty()) {
-                    auto* window = new fincept::WindowFrame(0);
-                    window->setAttribute(Qt::WA_DeleteOnClose);
-                    window->show();
-                } else {
-                    const int count = std::min(static_cast<int>(saved_ids.size()), max_windows);
-                    for (int i = 0; i < count; ++i) {
-                        auto* w = new fincept::WindowFrame(saved_ids[i]);
-                        w->setAttribute(Qt::WA_DeleteOnClose);
-                        w->show();
-                    }
-                    if (count < saved_ids.size()) {
-                        QList<int> trimmed = saved_ids.mid(0, count);
-                        fincept::SessionManager::instance().save_window_ids(trimmed);
-                                                LOG_INFO("App", QString("Clamped %1 saved windows to %2 (available screens)")
-                                            .arg(saved_ids.size()).arg(count));
-                    }
-                    if (count > 1)
-                        LOG_INFO("App", QString("Restored %1 window(s) from last session").arg(count));
-                }
+                const int primary_id = saved_ids.isEmpty() ? 0 : saved_ids.first();
+                auto* window = new fincept::WindowFrame(primary_id);
+                window->setAttribute(Qt::WA_DeleteOnClose);
+                window->show();
             }
 
             // Wire new-window handler + Launchpad surface now that the
@@ -986,42 +1042,45 @@ int main(int argc, char* argv[]) {
     // secondary-window restoration paths to avoid duplicating windows.
     bool recovered = false;
     if (auto* recovery = fincept::TerminalShell::instance().crash_recovery();
-        recovery && recovery->needs_recovery()) {
+        !smoke_mode && recovery && recovery->needs_recovery()) {
         fincept::screens::CrashRecoveryDialog dlg(
             recovery, fincept::TerminalShell::instance().snapshot_ring());
         dlg.exec();
         recovered = dlg.was_restored();
     }
 
-    // Restore the set of windows from last session. saved_ids is the complete
-    // set written by closeEvent (including the primary). If empty (first run),
-    // create a single primary window. Clamp to the number of available screens
-    // so a 3-monitor layout doesn't stack 3 windows on 1 screen after the user
-    // disconnects external displays.
+    // Restore a SINGLE primary window at startup. The previous session may
+    // have had several windows spread across multiple monitors, but auto-
+    // reopening all of them surprised multi-monitor users — every launch
+    // popped a second terminal on the second screen. Opening additional
+    // windows stays an EXPLICIT action (toolbar "New Window", Ctrl+Shift+N,
+    // the Launchpad button, tear-off), consistent with the single-instance
+    // relaunch policy in wire_app_lifecycle(). We reopen the lowest saved
+    // window_id (the primary) so its geometry + dock layout come back; the
+    // user spawns extra windows on demand. closeEvent self-heals the saved
+    // id set to the surviving windows, so this converges to [primary] cleanly.
     if (!recovered) {
         const QList<int> saved_ids =
             fincept::SessionManager::instance().load_window_ids();
-        const int max_windows = static_cast<int>(QGuiApplication::screens().size());
+        const int primary_id = saved_ids.isEmpty() ? 0 : saved_ids.first();
+        auto* primary = new fincept::WindowFrame(primary_id);
+        primary->setAttribute(Qt::WA_DeleteOnClose);
+        primary->show();
 
-        if (saved_ids.isEmpty()) {
-            auto* primary = new fincept::WindowFrame(0);
-            primary->setAttribute(Qt::WA_DeleteOnClose);
-            primary->show();
-        } else {
-            const int count = std::min(static_cast<int>(saved_ids.size()), max_windows);
-            for (int i = 0; i < count; ++i) {
-                auto* w = new fincept::WindowFrame(saved_ids[i]);
-                w->setAttribute(Qt::WA_DeleteOnClose);
-                w->show();
-            }
-            if (count < saved_ids.size()) {
-                QList<int> trimmed = saved_ids.mid(0, count);
-                fincept::SessionManager::instance().save_window_ids(trimmed);
-                                LOG_INFO("App", QString("Clamped %1 saved windows to %2 (available screens)")
-                                    .arg(saved_ids.size()).arg(count));
-            }
-            if (count > 1)
-                LOG_INFO("App", QString("Restored %1 window(s) from last session").arg(count));
+        // Smoke test: once the window has painted, walk every screen and exit
+        // with the result. Deferred so the shell + router are fully wired. The
+        // CI job runs this with Qt/VS stripped from PATH, so a missing bundled
+        // runtime (DLL, plugin, or data file like QtWebEngineProcess.exe) shows
+        // up as a hard process abort or a non-constructing screen here — exactly
+        // the class of failure the static dependency gate cannot detect.
+        if (smoke_mode) {
+            QPointer<fincept::WindowFrame> w = primary;
+            QTimer::singleShot(2500, &app, [w]() {
+                const int rc = fincept::run_screen_smoke_test(w ? w->dock_router() : nullptr);
+                std::fprintf(stderr, "[Smoke] exit %d\n", rc);
+                std::fflush(stderr);
+                QCoreApplication::exit(rc);
+            });
         }
     }
 

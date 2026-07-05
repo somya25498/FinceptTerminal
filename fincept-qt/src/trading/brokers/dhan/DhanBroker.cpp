@@ -373,12 +373,12 @@ ApiResponse<QVector<BrokerPosition>> DhanBroker::get_positions(const BrokerCrede
             pos.avg_price = p.value("avgCostPrice").toDouble();
         // Positions don't carry an LTP field; callers wanting live MTM must
         // refresh via /v2/marketfeed/ltp. Leave 0 here.
+        // TODO: hydrate LTP to populate pnl_pct
         pos.ltp = 0.0;
         pos.pnl = p.value("unrealizedProfit").toDouble();
         pos.day_pnl = p.value("realizedProfit").toDouble();
         pos.side = qty > 0 ? "LONG" : "SHORT";
-        if (pos.avg_price > 0 && pos.ltp > 0)
-            pos.pnl_pct = (pos.ltp - pos.avg_price) / pos.avg_price * 100.0;
+        pos.pnl_pct = (pos.avg_price > 0.0) ? ((pos.ltp - pos.avg_price) / pos.avg_price) * 100.0 : 0.0;
         positions.append(pos);
     }
     return {true, positions, "", ts};
@@ -389,6 +389,12 @@ ApiResponse<QVector<BrokerPosition>> DhanBroker::get_positions(const BrokerCrede
 ApiResponse<QVector<BrokerHolding>> DhanBroker::get_holdings(const BrokerCredentials& creds) {
     int64_t ts = now_ts();
     auto resp = BrokerHttp::instance().get(BASE + "/v2/holdings", auth_headers(creds));
+
+    // Dhan reports "account has no holdings" as an ERROR envelope ("No holdings
+    // available") rather than an empty array — surface it as a successful empty
+    // result so a connected account isn't flagged as a failed fetch.
+    if (!is_token_expired(resp) && resp.raw_body.contains("No holdings available", Qt::CaseInsensitive))
+        return {true, QVector<BrokerHolding>{}, "", ts};
 
     if (!resp.success || resp.json.value("errorType").toString().length() > 0)
         return {false, std::nullopt, checked_error(resp, "get_holdings failed"), ts};
@@ -410,6 +416,7 @@ ApiResponse<QVector<BrokerHolding>> DhanBroker::get_holdings(const BrokerCredent
         holding.avg_price = h.value("avgCostPrice").toDouble();
         // /v2/holdings does NOT return an LTP field. Caller must hydrate via
         // /v2/marketfeed/ltp using securityId — leave zero rather than fabricate.
+        // TODO: hydrate LTP to populate current_value/pnl
         holding.ltp = 0.0;
         holding.invested_value = holding.quantity * holding.avg_price;
         holding.current_value = 0.0;
@@ -623,7 +630,11 @@ ApiResponse<QVector<BrokerCandle>> DhanBroker::get_history(const BrokerCredentia
         const int count = qMin(timestamps.size(), closes.size());
         for (int i = 0; i < count; ++i) {
             BrokerCandle c;
-            c.timestamp = static_cast<int64_t>(timestamps[i].toDouble());
+            // Dhan returns epoch SECONDS; BrokerCandle.timestamp is milliseconds
+            // (EquityChartPanel divides by 1000 and rolls the live bar against
+            // currentMSecsSinceEpoch). Without ×1000 candles land in Jan 1970 and
+            // the forming bar rolls on every tick ("chart goes every second").
+            c.timestamp = static_cast<int64_t>(timestamps[i].toDouble()) * 1000;
             c.open = opens.size() > i ? opens[i].toDouble() : 0.0;
             c.high = highs.size() > i ? highs[i].toDouble() : 0.0;
             c.low = lows.size() > i ? lows[i].toDouble() : 0.0;

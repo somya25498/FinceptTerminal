@@ -5,6 +5,7 @@
 
 #include <QHideEvent>
 #include <QLabel>
+#include <QPushButton>
 #include <QShowEvent>
 #include <QTabWidget>
 #include <QTimer>
@@ -46,6 +47,19 @@ class EquityResearchScreen : public QWidget, public IStatefulScreen, public IGro
     void on_quote_loaded(services::equity::QuoteData quote);
     void on_info_loaded(services::equity::StockInfo info);
     void on_tab_changed(int index);
+    void on_quote_loaded(services::equity::QuoteData quote);
+    void on_info_loaded(services::equity::StockInfo info);
+    void on_tab_changed(int index);
+
+    // BUY/SELL from the title bar → routes the current symbol to the existing
+    // Equity Trading order ticket (same form + paper/live engine) via EventBus.
+    void on_trade_clicked(bool is_buy);
+
+    // Opens the "Download Price Data (CSV)" dialog and exports yfinance OHLCV
+    // history for current_symbol_ to a user-chosen file.
+    void on_download_csv_clicked();
+
+    void on_financials_loaded(services::equity::FinancialsData data);
     void on_download_csv_clicked();
     void on_financials_loaded(services::equity::FinancialsData data);
 
@@ -58,10 +72,17 @@ class EquityResearchScreen : public QWidget, public IStatefulScreen, public IGro
     void retranslateUi();
     void hub_subscribe_broker_quote();
     void hub_unsubscribe_broker_quote();
+    // Show the BUY/SELL buttons only when a broker is connected (paper or live)
+    // AND the current symbol is tradable via those (Indian) brokers (.NS/.BO).
+    void update_trade_buttons();
 
     QLabel* title_label_  = nullptr;
     QLabel* symbol_label_ = nullptr;
-    QLabel* hint_label_   = nullptr;
+    QLabel* title_label_ = nullptr;
+    QLabel* symbol_label_ = nullptr;
+    QPushButton* buy_btn_ = nullptr;
+    QPushButton* sell_btn_ = nullptr;
+    QLabel* hint_label_ = nullptr;
 
     QLabel* sym_label_    = nullptr;
     QLabel* price_label_  = nullptr;
@@ -76,16 +97,21 @@ class EquityResearchScreen : public QWidget, public IStatefulScreen, public IGro
     EquityFinancialsTab* financials_tab_ = nullptr;
     EquityAnalysisTab*   analysis_tab_   = nullptr;
     EquityTechnicalsTab* technicals_tab_ = nullptr;
-    EquityTalippTab*     talipp_tab_     = nullptr;
-    EquityPeersTab*      peers_tab_      = nullptr;
-    EquityNewsTab*       news_tab_       = nullptr;
-    EquitySentimentTab*  sentiment_tab_  = nullptr;
-    EquityValuationTab*  valuation_tab_  = nullptr;
+    EquityTechnicalsTab* technicals_tab_ = nullptr;
+    EquityTalippTab* talipp_tab_ = nullptr;
+    EquityPeersTab* peers_tab_ = nullptr;
+    EquityNewsTab* news_tab_ = nullptr;
+    EquitySentimentTab* sentiment_tab_ = nullptr;
+    EquityValuationTab* valuation_tab_ = nullptr;
 
-    QTimer*  refresh_timer_    = nullptr;
-    QString  current_symbol_;
-    QString  current_currency_;
-    bool     hub_broker_active_ = false;
+    QTimer* refresh_timer_ = nullptr;
+    QString current_symbol_;
+    QString current_currency_;
+    double last_price_ = 0.0; // freshest quote price, seeds the order ticket
+    bool hub_broker_active_ = false;
+
+    // Symbol group link — SymbolGroup::None when unlinked.
+    SymbolGroup link_group_ = SymbolGroup::None;
     SymbolGroup link_group_ = SymbolGroup::None;
 };
 

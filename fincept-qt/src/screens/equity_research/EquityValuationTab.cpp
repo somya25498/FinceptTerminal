@@ -443,7 +443,12 @@ void EquityValuationTab::run_scoring_models() {
         pio_body["prev_long_term_debt"]     = get_stmt_val(bs, "Long Term Debt",  1);
         pio_body["prev_current_assets"]     = get_stmt_val(bs, "Current Assets",  1);
         pio_body["prev_current_liabilities"]= get_stmt_val(bs, "Current Liabilities", 1);
-        pio_body["prev_shares_outstanding"] = last_info_.shares_outstanding;
+        // TODO:
+// Previous year's shares outstanding is currently unavailable.
+// Using current shares as a placeholder disables dilution detection.
+pio_body["prev_shares_outstanding"] =
+    last_info_.shares_outstanding;
+        
         pio_body["prev_gross_profit"]       = get_stmt_val(is, "Gross Profit",    1);
         pio_body["prev_revenue"]            = get_stmt_val(is, "Total Revenue",   1);
 

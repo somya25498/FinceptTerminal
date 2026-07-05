@@ -64,14 +64,11 @@ void LlmService::ensure_config() const {
     // those re-resolve every call so a login that happens after first ensure_config() doesn't 401 forever.
     if (config_loaded_) {
         if (provider_ == "fincept") {
-            const auto& sess = fincept::auth::AuthManager::instance().session();
-            if (!sess.api_key.isEmpty()) {
-                api_key_ = sess.api_key;
-            } else {
-                auto stored = SettingsRepository::instance().get("fincept_api_key");
-                if (stored.is_ok() && !stored.value().isEmpty())
-                    api_key_ = stored.value();
-            }
+            // Resolve via AuthManager (session → SecureStorage). Never the
+            // legacy plaintext settings row (CR-08).
+            const QString key = fincept::auth::AuthManager::instance().fincept_api_key();
+            if (!key.isEmpty())
+                api_key_ = key;
         }
         return;
     }
@@ -113,16 +110,12 @@ void LlmService::ensure_config() const {
         LOG_INFO(kLlmSvcTag, "No LLM provider configured — using Fincept default");
     }
 
-    // Fincept key always comes from the live AuthManager session; SettingsRepository fallback is the legacy path.
+    // Fincept key resolves via AuthManager (live session → encrypted
+    // SecureStorage). The legacy plaintext settings row is no longer read (CR-08).
     if (provider_ == "fincept") {
-        const auto& sess = fincept::auth::AuthManager::instance().session();
-        if (!sess.api_key.isEmpty()) {
-            api_key_ = sess.api_key;
-        } else {
-            auto stored_key = SettingsRepository::instance().get("fincept_api_key");
-            if (stored_key.is_ok() && !stored_key.value().isEmpty())
-                api_key_ = stored_key.value();
-        }
+        const QString key = fincept::auth::AuthManager::instance().fincept_api_key();
+        if (!key.isEmpty())
+            api_key_ = key;
     }
 
     auto gs = LlmConfigRepository::instance().get_global_settings();
@@ -386,6 +379,9 @@ QString LlmService::get_endpoint_url() const {
         // Fallback for when the prefilled base_url was cleared; the custom-base_url
         // branch above wins whenever it's set (incl. regional/proxy overrides).
         return "https://aihubmix.com/v1/chat/completions";
+    if (p == "atlascloud")
+        // Fallback if the prefilled base_url was cleared; custom-base_url branch wins otherwise.
+        return "https://api.atlascloud.ai/v1/chat/completions";
     return {};
 }
 
@@ -841,9 +837,12 @@ LlmResponse LlmService::do_streaming_request(const QString& user_message,
     // `delta.content` wrapped in <think> tags. The user shouldn't see that —
     // only the answer. State persists across SSE chunks because tags can
     // straddle the chunk boundary ("<thi" + "nk>...").
+    // Returns the visible (answer) text; any reasoning found inside <think>…</think>
+    // is appended to *think_out so the caller can route it to the Thinking channel
+    // rather than dropping it.
     bool in_think = false;
     QString think_pending;
-    auto filter_think = [&](const QString& chunk) -> QString {
+    auto filter_think = [&](const QString& chunk, QString* think_out) -> QString {
         QString out;
         QString work = think_pending + chunk;
         think_pending.clear();
@@ -855,9 +854,13 @@ LlmResponse LlmService::do_streaming_request(const QString& user_message,
                 if (end < 0) {
                     // Hold last 8 chars in case </think> straddles.
                     qsizetype safe = std::max<qsizetype>(pos, n - 8);
+                    if (think_out)
+                        *think_out += work.mid(pos, safe - pos);
                     think_pending = work.mid(safe);
                     return out;
                 }
+                if (think_out)
+                    *think_out += work.mid(pos, end - pos);
                 in_think = false;
                 pos = end + 8;
             } else {
@@ -978,9 +981,15 @@ LlmResponse LlmService::do_streaming_request(const QString& user_message,
                 }
             }
 
-            QString chunk = parse_sse_chunk(data, provider_);
-            if (!chunk.isEmpty()) {
-                accumulated += chunk;
+            const SseDelta delta = parse_sse_chunk(data, provider_);
+            if (delta.is_reasoning) {
+                // Chain-of-thought (reasoning_content / Anthropic thinking_delta).
+                // Route to the UI's separate Thinking channel via the sentinel
+                // prefix; never accumulate it into the answer or stored content.
+                if (!delta.text.isEmpty())
+                    on_chunk(think_stream_prefix() + delta.text, false);
+            } else if (!delta.text.isEmpty()) {
+                accumulated += delta.text;
 
                 // Some providers stream tool calls as XML/text markup — detect, suppress output, fall back to do_request.
                 // Patterns covered: <tool_call>, </tool_call>, <minimax:tool_call>, <invoke name=,
@@ -1000,7 +1009,13 @@ LlmResponse LlmService::do_streaming_request(const QString& user_message,
                     }
                 }
 
-                const QString visible = filter_think(chunk);
+                // Inline <think>…</think> reasoning (MiniMax M2.7, DeepSeek-R1
+                // derivatives) gets split out here: think_seg → Thinking channel,
+                // visible → answer bubble.
+                QString think_seg;
+                const QString visible = filter_think(delta.text, &think_seg);
+                if (!think_seg.isEmpty())
+                    on_chunk(think_stream_prefix() + think_seg, false);
                 if (!visible.isEmpty())
                     on_chunk(visible, false);
             }
@@ -1056,7 +1071,10 @@ LlmResponse LlmService::do_streaming_request(const QString& user_message,
             resp.error = reply->errorString();
         LOG_ERROR(kLlmSvcTag, "Stream request failed: " + resp.error);
     } else if (status >= 200 && status < 300) {
-        resp.content = accumulated;
+        // `accumulated` holds only answer deltas (reasoning_content was routed to
+        // the Thinking channel and never added here). Strip any inline <think>…
+        // </think> blocks so the persisted/replayed content is the answer alone.
+        resp.content = strip_think_blocks(accumulated);
         resp.success = true;
         if (!final_usage_obj.isEmpty()) {
             QJsonObject wrap{{"usage", final_usage_obj}};
